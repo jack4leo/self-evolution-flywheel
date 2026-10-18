@@ -21,6 +21,10 @@ class InstallerIgnoreDiagnosticsTests(unittest.TestCase):
         env = os.environ.copy()
         for key in (
             "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_IMPLICIT_WORK_TREE", "GIT_PREFIX", "GIT_GRAFT_FILE", "GIT_SHALLOW_FILE",
+            "GIT_REPLACE_REF_BASE", "GIT_NO_REPLACE_OBJECTS", "GIT_NAMESPACE",
+            "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
             "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
         ):
             env.pop(key, None)
@@ -277,6 +281,111 @@ class InstallerIgnoreDiagnosticsTests(unittest.TestCase):
             self.assertIn(NOTICE, result.stdout)
             self.assertNotIn(WARNING, result.stdout)
             self._assert_preserved(preserved, list(preserved))
+
+    def test_foreign_repository_environment_cannot_hide_target_ignore(self):
+        variants = (
+            "git-dir", "index", "worktree", "dir-and-worktree", "common-dir",
+            "implicit-worktree", "ceiling", "combined",
+        )
+        for variant in variants:
+            with self.subTest(variant=variant), self._fixture() as fixture:
+                _, root, repo, _, global_config, env = fixture
+                target = repo / "nested" / "child"
+                target.mkdir(parents=True)
+                ignore = repo / ".gitignore"
+                ignore.write_text("AGENTS.md\n", encoding="utf-8")
+                foreign = root / "foreign"
+                self._init(foreign, env)
+                foreign_agents = foreign / "nested" / "child" / "AGENTS.md"
+                foreign_agents.parent.mkdir(parents=True)
+                foreign_agents.write_text("foreign tracked file\n", encoding="utf-8")
+                self._git(foreign, "add", ".", env=env)
+                foreign_git = foreign / ".git"
+                overrides = {
+                    "git-dir": {"GIT_DIR": str(foreign_git)},
+                    "index": {"GIT_INDEX_FILE": str(foreign_git / "index")},
+                    "worktree": {"GIT_WORK_TREE": str(foreign)},
+                    "dir-and-worktree": {
+                        "GIT_DIR": str(foreign_git), "GIT_WORK_TREE": str(foreign),
+                    },
+                    "common-dir": {"GIT_COMMON_DIR": str(foreign_git)},
+                    "implicit-worktree": {"GIT_IMPLICIT_WORK_TREE": "0"},
+                    "ceiling": {"GIT_CEILING_DIRECTORIES": str(target.parent)},
+                    "combined": {
+                        "GIT_DIR": str(foreign_git), "GIT_WORK_TREE": str(foreign),
+                        "GIT_COMMON_DIR": str(foreign_git),
+                        "GIT_INDEX_FILE": str(foreign_git / "index"),
+                        "GIT_OBJECT_DIRECTORY": str(foreign_git / "objects"),
+                        "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(foreign_git / "objects"),
+                        "GIT_PREFIX": "foreign/", "GIT_IMPLICIT_WORK_TREE": "0",
+                        "GIT_CEILING_DIRECTORIES": str(target.parent),
+                        "GIT_DISCOVERY_ACROSS_FILESYSTEM": "0",
+                    },
+                }[variant]
+                paths = [ignore, repo / ".git/config", global_config,
+                         foreign_git / "config", foreign_git / "index", foreign_agents]
+                before = self._snapshot(paths)
+                self._oracle(target, env, True)
+                result = self._run(target, dict(env, **overrides))
+                self._assert_warning(result, ".gitignore", 1, "AGENTS.md")
+                self.assertNotIn(NOTICE, result.stdout)
+                self.assertNotIn("cannot check Git ignore status", result.stdout)
+                self._assert_preserved(before, paths)
+
+    def test_foreign_index_cannot_turn_tracked_target_into_ignore_warning(self):
+        with self._fixture() as fixture:
+            _, root, target, _, _, env = fixture
+            agents = target / "AGENTS.md"
+            agents.write_bytes((REPO_ROOT / "AGENTS.md").read_bytes())
+            self._git(target, "add", "AGENTS.md", env=env)
+            (target / ".gitignore").write_text("AGENTS.md\n", encoding="utf-8")
+            foreign = root / "foreign"
+            self._init(foreign, env)
+            (foreign / "other").write_text("foreign\n", encoding="utf-8")
+            self._git(foreign, "add", "other", env=env)
+            paths = [target / ".git/index", foreign / ".git/index"]
+            before = self._snapshot(paths)
+            result = self._run(target, dict(env, GIT_INDEX_FILE=str(foreign / ".git/index")))
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertIn(NOTICE, result.stdout)
+            self.assertNotIn(WARNING, result.stdout)
+            self._assert_preserved(before, paths)
+
+    def test_foreign_git_dir_does_not_give_non_git_target_ignore_semantics(self):
+        with self._fixture() as fixture:
+            _, root, foreign, _, _, env = fixture
+            target = root / "non-git"
+            target.mkdir()
+            (foreign / ".gitignore").write_text("AGENTS.md\n", encoding="utf-8")
+            (foreign / "AGENTS.md").write_text("foreign tracked file\n", encoding="utf-8")
+            self._git(foreign, "add", "-f", "AGENTS.md", env=env)
+            result = self._run(target, dict(env, GIT_DIR=str(foreign / ".git")))
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertNotIn(WARNING, result.stdout)
+            self.assertNotIn(NOTICE, result.stdout)
+            self.assertNotIn("cannot check Git ignore status", result.stdout)
+
+    def test_repository_environment_isolated_without_losing_config_overrides(self):
+        for config_kind in ("count", "parameters"):
+            with self.subTest(config_kind=config_kind), self._fixture() as fixture:
+                _, root, target, _, global_config, env = fixture
+                foreign = root / "foreign"
+                self._init(foreign, env)
+                exclude = root / "override-ignore"
+                exclude.write_text("# configured\nAGENTS.md\n", encoding="utf-8")
+                overrides = {"GIT_DIR": str(foreign / ".git"),
+                             "GIT_WORK_TREE": str(foreign)}
+                if config_kind == "count":
+                    overrides.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.excludesFile",
+                                     GIT_CONFIG_VALUE_0=str(exclude))
+                else:
+                    overrides["GIT_CONFIG_PARAMETERS"] = f"'core.excludesFile={exclude}'"
+                paths = [exclude, global_config, target / ".git/config", foreign / ".git/config"]
+                before = self._snapshot(paths)
+                result = self._run(target, dict(env, **overrides))
+                self._assert_warning(result, str(exclude), 2, "AGENTS.md")
+                self.assertNotIn("cannot check Git ignore status", result.stdout)
+                self._assert_preserved(before, paths)
 
     def test_no_hooks_subdirectory_uses_parent_gitignore_rule(self):
         with self._fixture() as fixture:

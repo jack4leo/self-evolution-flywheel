@@ -842,6 +842,18 @@ import sys
 
 target = sys.argv[1]
 env = dict(os.environ, LC_ALL="C", GIT_OPTIONAL_LOCKS="0")
+# -C changes the working directory, but inherited hook/repository variables can
+# still select a foreign Git directory, index, worktree, or discovery boundary.
+# Isolate only repository-local state for these read-only diagnostics. Keep HOME,
+# XDG_CONFIG_HOME and GIT_CONFIG* so normal global/configured excludes still apply.
+for name in (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_IMPLICIT_WORK_TREE", "GIT_PREFIX", "GIT_GRAFT_FILE", "GIT_SHALLOW_FILE",
+    "GIT_REPLACE_REF_BASE", "GIT_NO_REPLACE_OBJECTS", "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+):
+    env.pop(name, None)
 
 
 def git(*args, input=None):
