@@ -1171,6 +1171,7 @@ grep -Fq 'Cloning Self-Evolution Flywheel source' "$TMP_DIR/remote.log" \
 python3 "$REPO_ROOT/tests/test-installer-races.py"
 python3 "$REPO_ROOT/tests/test-installer-recovery.py"
 python3 "$REPO_ROOT/tests/test-installer-security.py"
+PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/tests/test-installer-ignore.py"
 PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/tests/test-session-start.py"
 PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/tests/test-range-freezer.py"
 PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/tests/test-range-writer.py"

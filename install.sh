@@ -832,6 +832,86 @@ fi
 # or a manual-merge exit must not undo an otherwise completed install.
 transaction_active=0
 
+# Ask Git, not a partial .gitignore parser: this includes info/exclude and the
+# effective global excludesFile, with normal precedence and negation semantics.
+# Diagnostics are advisory even if Git is unavailable or a query fails.
+if ! python3 - "$TARGET_DIR" <<'PY'
+import os
+import subprocess
+import sys
+
+target = sys.argv[1]
+env = dict(os.environ, LC_ALL="C", GIT_OPTIONAL_LOCKS="0")
+# -C changes the working directory, but inherited hook/repository variables can
+# still select a foreign Git directory, index, worktree, or discovery boundary.
+# Isolate only repository-local state for these read-only diagnostics. Keep HOME,
+# XDG_CONFIG_HOME and GIT_CONFIG* so normal global/configured excludes still apply.
+for name in (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_IMPLICIT_WORK_TREE", "GIT_PREFIX", "GIT_GRAFT_FILE", "GIT_SHALLOW_FILE",
+    "GIT_REPLACE_REF_BASE", "GIT_NO_REPLACE_OBJECTS", "GIT_NAMESPACE",
+    "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+):
+    env.pop(name, None)
+
+
+def git(*args, input=None):
+    return subprocess.run(
+        ["git", "-C", target, *args], input=input,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, timeout=10,
+    )
+
+
+def check():
+    repository = git("rev-parse", "--is-inside-work-tree")
+    if repository.returncode:
+        if b"not a git repository" in repository.stderr.lower():
+            return  # File-only installation outside Git has no ignore semantics.
+        raise RuntimeError("Git could not identify the target worktree")
+    if repository.stdout.strip() != b"true":
+        return
+
+    tracked = git("--literal-pathspecs", "ls-files", "--error-unmatch", "--", "AGENTS.md")
+    if tracked.returncode == 0:
+        print("NOTICE: AGENTS.md is already tracked; Git ignore rules do not apply to it.")
+        return
+    if tracked.returncode != 1:
+        raise RuntimeError("Git could not inspect the index")
+
+    ignored = git("check-ignore", "--verbose", "-z", "--stdin", input=b"AGENTS.md\0")
+    if ignored.returncode == 1 and not ignored.stdout:
+        return
+    if ignored.returncode != 0:
+        raise RuntimeError("git check-ignore failed")
+    fields = ignored.stdout.split(b"\0")
+    if len(fields) != 5 or fields[-1] or fields[3] != b"AGENTS.md":
+        raise RuntimeError("unexpected git check-ignore output")
+    source, line, pattern = fields[:3]
+    if pattern.startswith(b"!"):
+        return  # Verbose Git output includes winning negations, not just ignores.
+
+    # Escape control characters in user-owned rule paths/patterns before display.
+    rule = ascii(os.fsdecode(source + b":" + line + b":" + pattern))
+    print(
+        "WARNING: AGENTS.md is untracked and ignored by Git; "
+        f"matching rule {rule}. It remains on disk but is normally omitted from "
+        "git status and ordinary git add, so it will not be shared in a commit "
+        "without maintainer action. Ignore rules were not changed.",
+        file=sys.stderr,
+    )
+
+
+try:
+    check()
+except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+    print(f"WARNING: cannot check Git ignore status for AGENTS.md: {ascii(str(exc))}; "
+          "completed installation was preserved; ignore rules were not changed.", file=sys.stderr)
+PY
+then
+  echo "WARNING: cannot check Git ignore status for AGENTS.md; completed installation was preserved; ignore rules were not changed." >&2
+fi
+
 if ((${#conflicts[@]})); then
   echo
 echo "Some existing project files were preserved. Review/merge these if you want the template version:"
