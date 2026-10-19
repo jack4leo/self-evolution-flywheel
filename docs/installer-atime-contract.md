@@ -16,6 +16,8 @@
 
 安装器不恢复既有 inode 的 atime，不尝试设置 ctime，也不在普通读取后采样一个新 ctime 来重新授权原件。新 staging inode 按原件设置 mtime，但不重用原件 atime。允许读取副作用不授权改变业务内容或其他元数据。
 
+`noatime` 约束的是**同一 inode 的读取副作用**，不是新建文件的初始访问时间。成功更新受管区后，活动路径指向新 staging inode；不能拿它的 atime 与旧 inode 作等值比较。回归必须分别验证：恢复备份仍是 pinned 原 inode、原文及受保护元数据完整，且原 inode 的读取符合挂载行为；新活动 inode 的内容及应保留元数据正确、不复用旧 atime；同版重试不替换活动 inode、不新增备份，并继续满足同 inode 的读取契约。原 inode 的 ctime 仍允许那次已验证 exchange 自身引起的变化，不能扩大为对其他写入的豁免。
+
 ## 仍然严格的版本检查
 
 读取前后与确认前的检查排除 atime，但保留 device/inode、nlink、类型/mode、owner/group、size、内容 hash、mtime、**ctime**、全部可枚举 xattrs，以及 Darwin ACL 和 BSD flags。确认绑定父目录身份；读取/枚举错误、版本变化和 staging 不一致都拒绝。

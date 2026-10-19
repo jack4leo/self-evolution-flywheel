@@ -348,11 +348,24 @@ class FrameworkOwnershipTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0); self.assertEqual(before, self.snapshot(target))
 
     def test_agents_invalid_utf8_and_mixed_newlines_are_preserved(self) -> None:
-        target = self.project(); path = target / "AGENTS.md"
-        data = b"# User\r\ninvalid: \xff\xfe\n" + ROOT.joinpath("AGENTS.md").read_bytes() + b"outside\r\n"
-        path.write_bytes(data); before = path.read_bytes(); result = self.run_install(ROOT, target)
+        target = self.project()
+        path = target / "AGENTS.md"
+        prefix, suffix = b"# User\r\ninvalid: \xff\xfe\n", b"\noutside\r\n"
+        source = ROOT.joinpath("AGENTS.md").read_bytes()
+        managed = source[source.index(ROUTING_BEGIN):source.index(ROUTING_END) + len(ROUTING_END)]
+        original = prefix + ROUTING_BEGIN + b"\nold managed route\n" + ROUTING_END + suffix
+        path.write_bytes(original)
+        result = self.run_install(ROOT, target)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(path.read_bytes(), before)
+        updated = prefix + managed + suffix
+        self.assertEqual(path.read_bytes(), updated)
+        backups = list(target.glob(".AGENTS.md.confirm-backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), original)
+        repeat = self.run_install(ROOT, target)
+        self.assertEqual(repeat.returncode, 0, repeat.stdout + repeat.stderr)
+        self.assertEqual(path.read_bytes(), updated)
+        self.assertEqual(list(target.glob(".AGENTS.md.confirm-backup-*")), backups)
 
 
 if __name__ == "__main__":

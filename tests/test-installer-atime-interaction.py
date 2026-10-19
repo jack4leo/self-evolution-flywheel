@@ -198,7 +198,10 @@ class InstallerAtimeInteractionTests(unittest.TestCase):
             self.assertEqual(after[key], value, f"{path} metadata field changed: {key}")
         self.assertEqual(after_bytes, before_bytes)
 
-    def assert_expected_atime(self, before, after):
+    def assert_expected_read_atime(self, before, after):
+        # Mount read semantics describe one inode, never a pathname replacement.
+        self.assertEqual((after["dev"], after["ino"]), (before["dev"], before["ino"]),
+                         "read-atime expectations require the same inode")
         if ATIME_EXPECTATION is None and sys.platform.startswith("linux"):
             return
         if ATIME_EXPECTATION == "1":
@@ -245,7 +248,7 @@ class InstallerAtimeInteractionTests(unittest.TestCase):
                     self.assertEqual(code, 0, output)
                     self.assertTrue(sent)
                 after = metadata(path)
-                self.assert_expected_atime(before, after)
+                self.assert_expected_read_atime(before, after)
                 self.assert_unchanged_except_atime(path, before, original)
                 if mode == "notty":
                     self.assertNotIn(b"[y/N]", output)
@@ -286,21 +289,73 @@ class InstallerAtimeInteractionTests(unittest.TestCase):
                 self.assertEqual(code, 0, output)
                 self.assertFalse(sent) if mode == "notty" else self.assertTrue(sent)
                 after = metadata(path)
-                self.assert_expected_atime(before, after)
+                self.assert_expected_read_atime(before, after)
                 self.assert_unchanged_except_atime(path, before, original)
+
+    def test_read_atime_expectations_reject_replaced_inodes(self):
+        before = {"dev": 1, "ino": 10, "atime_ns": 1_000_000_000}
+        after = {**before, "ino": 11}
+        with self.assertRaisesRegex(AssertionError, "same inode"):
+            self.assert_expected_read_atime(before, after)
 
     def test_marked_agents_auto_update_without_prompt(self):
         path = self.project / "AGENTS.md"
         begin = b"<!-- BEGIN SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->"
         end = b"<!-- END SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->"
-        path.write_bytes(b"user prefix\n" + begin + b"\nold managed route\n" + end + b"\nuser suffix\n")
-        before, original = fixture_baseline(path)
-        code, output, sent = run_pty(self.command(), "y")
-        self.assertEqual((code, sent), (0, False), output)
-        self.assertNotEqual(path.read_bytes(), original)
-        self.assertIn(b"user prefix", path.read_bytes())
-        self.assertIn(b"user suffix", path.read_bytes())
-        self.assert_expected_atime(before, metadata(path))
+        prefix, suffix = b"user prefix\r\n", b"\nuser suffix\r\n"
+        path.write_bytes(prefix + begin + b"\nold managed route\n" + end + suffix)
+        os.chmod(path, 0o640)
+        os.utime(path, ns=(1_000_000_000, 2_000_000_000))
+        seed_fd = os.open(path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            M.xattr_set(seed_fd, "user.flywheel.agents-atime", b"\x00preserved\xff")
+        finally:
+            os.close(seed_fd)
+        # No writable fixture descriptor remains open during the installation.
+        original_fd = _open_read(path)
+        try:
+            before, original = fixture_baseline(path)
+            pinned = os.fstat(original_fd)
+            self.assertEqual((pinned.st_dev, pinned.st_ino), (before["dev"], before["ino"]))
+            code, output, sent = run_pty(self.command(), "y")
+            self.assertEqual((code, sent), (0, False), output)
+
+            # Successful exchange changes the active inode. noatime suppresses
+            # read side effects, not creation timestamps on a fresh staging inode.
+            active = metadata(path)
+            self.assertNotEqual((active["dev"], active["ino"]), (before["dev"], before["ino"]))
+            self.assertNotEqual(active["atime_ns"], before["atime_ns"],
+                                "replacement must not inherit the original's stale atime")
+            source = (ROOT / "AGENTS.md").read_bytes()
+            managed = source[source.index(begin):source.index(end) + len(end)]
+            self.assertEqual(content(path), prefix + managed + suffix)
+            for key in ("nlink", "mode", "uid", "gid", "mtime_ns", "flags", "xattrs", "protected"):
+                self.assertEqual(active[key], before[key], key)
+
+            backups = list(path.parent.glob(".AGENTS.md.confirm-backup-*"))
+            self.assertEqual(len(backups), 1, output)
+            backup = backups[0]
+            displaced = metadata(backup)
+            pinned = os.fstat(original_fd)
+            self.assertEqual((displaced["dev"], displaced["ino"]), (pinned.st_dev, pinned.st_ino))
+            # This is the original inode: the strict normal/noatime read contract
+            # still applies, as do exact original bytes and protected metadata.
+            self.assert_expected_read_atime(before, displaced)
+            self.assertEqual(content(backup), original)
+            for key in ("dev", "ino", "nlink", "mode", "uid", "gid", "size", "mtime_ns", "flags", "xattrs", "protected"):
+                self.assertEqual(displaced[key], before[key], key)
+
+            # Same-version retry is read-only for the now-active inode. Reset the
+            # private fixture's atime to make read side effects observable again.
+            retry_before, retry_bytes = fixture_baseline(path)
+            code, output, sent = run_pty(self.command(), None)
+            self.assertEqual((code, sent), (0, False), output)
+            self.assert_expected_read_atime(retry_before, metadata(path))
+            self.assert_unchanged_except_atime(path, retry_before, retry_bytes)
+            self.assertEqual(list(path.parent.glob(".AGENTS.md.confirm-backup-*")), backups)
+            self.assertEqual(content(backup), original)
+        finally:
+            os.close(original_fd)
 
     def test_atime_read_after_proposal_is_allowed_but_ctime_mutation_is_rejected(self):
         path = self.seed_claude()
