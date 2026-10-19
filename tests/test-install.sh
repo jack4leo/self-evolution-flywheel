@@ -247,26 +247,28 @@ recovery_dir="$(sed -n 's/^ERROR: rollback snapshots retained for recovery at: /
 snapshot_failure_modules="$TMP_DIR/snapshot-failure-modules"
 mkdir -p "$snapshot_failure_modules"
 cat > "$snapshot_failure_modules/sitecustomize.py" <<'PY'
-import builtins
 import os
 
-_open = builtins.open
-def _fail_agents_snapshot(file, *args, **kwargs):
+_open = os.open
+def _fail_agents_snapshot(file, flags, *args, **kwargs):
     try:
         path = os.fspath(file)
     except TypeError:
         path = ""
-    mode = args[0] if args else kwargs.get("mode", "r")
-    if os.path.basename(path) == "agents.original" and "w" in mode:
+    if os.path.basename(path).startswith("agents.original.tmp-") and flags & os.O_CREAT:
         raise OSError("injected AGENTS baseline snapshot failure")
-    return _open(file, *args, **kwargs)
-builtins.open = _fail_agents_snapshot
+    return _open(file, flags, *args, **kwargs)
+os.open = _fail_agents_snapshot
 PY
 snapshot_failure_target="$TMP_DIR/snapshot-failure-target"
 mkdir -p "$snapshot_failure_target"
 printf '# Preserve during snapshot failure\n' > "$snapshot_failure_target/AGENTS.md"
 cp "$snapshot_failure_target/AGENTS.md" "$TMP_DIR/snapshot-failure-before.md"
-PYTHONPATH="$snapshot_failure_modules" bash "$REPO_ROOT/install.sh" --target "$snapshot_failure_target" --no-hooks > "$TMP_DIR/snapshot-failure.log" 2>&1
+if PYTHONPATH="$snapshot_failure_modules" bash "$REPO_ROOT/install.sh" --target "$snapshot_failure_target" --no-hooks > "$TMP_DIR/snapshot-failure.log" 2>&1; then
+  fail "AGENTS snapshot failure unexpectedly reported complete installation"
+else
+  [[ "$?" == 4 ]] || fail "AGENTS snapshot failure did not report incomplete status 4"
+fi
 cmp -s "$TMP_DIR/snapshot-failure-before.md" "$snapshot_failure_target/AGENTS.md" \
   || fail "AGENTS snapshot failure changed the existing file"
 grep -Fq 'injected AGENTS baseline snapshot failure' "$TMP_DIR/snapshot-failure.log" \
@@ -690,38 +692,35 @@ cmp -s "$TMP_DIR/original-session-start.sh" "$conflict_target/.agent-maintenance
 [[ ! -e "$conflict_target/.codex/hooks.json" ]] || fail "--no-hooks registered a Codex hook"
 [[ ! -e "$conflict_target/.claude/settings.json" ]] || fail "--no-hooks registered a Claude hook"
 
-# A differing AGENTS.md is never replaced silently. The installer displays a
-# proposed diff and requires a manual merge without asking for a fake confirmation.
+# A differing AGENTS.md displays the complete proposed diff in a PTY and applies
+# it only after an explicit y/Y confirmation.
 agents_target="$TMP_DIR/agents-target"
 mkdir -p "$agents_target"
 printf '# Maintainer-owned guidance\n\nKeep this text byte-for-byte.\n' > "$agents_target/AGENTS.md"
 cp "$agents_target/AGENTS.md" "$TMP_DIR/agents-before.md"
-if run_installer_in_pty "$REPO_ROOT/install.sh" "$agents_target" y "$TMP_DIR/agents-insert.log"; then
-  fail "installer updated a pre-existing AGENTS.md without conditional replacement"
-else
-  [[ "$?" == 4 ]] || fail "unsafe AGENTS.md update did not return incomplete status 4"
+if ! run_installer_in_pty "$REPO_ROOT/install.sh" "$agents_target" y "$TMP_DIR/agents-insert.log"; then
+  fail "explicit y confirmation did not apply the AGENTS.md update"
 fi
 grep -Fq -- '--- AGENTS.md (current)' "$TMP_DIR/agents-insert.log" \
   || fail "AGENTS.md proposed diff was not displayed"
-if grep -Fq '[y/N]' "$TMP_DIR/agents-insert.log"; then
-  fail "AGENTS.md conflict asked for a confirmation the installer cannot honor"
-fi
-grep -Fq 'merge the reviewed block manually' "$TMP_DIR/agents-insert.log" \
-  || fail "AGENTS.md proposed diff did not explain the manual merge"
-cmp -s "$TMP_DIR/agents-before.md" "$agents_target/AGENTS.md" \
-  || fail "confirmed AGENTS.md update changed the maintainer-owned file"
+grep -Fq '[y/N]' "$TMP_DIR/agents-insert.log" \
+  || fail "AGENTS.md conflict did not request confirmation in a PTY"
+grep -Fq 'Installation complete for:' "$TMP_DIR/agents-insert.log" \
+  || fail "confirmed AGENTS.md update did not complete installation"
 [[ -f "$agents_target/prompts/bootstrap-project.md" ]] \
-  || fail "AGENTS.md preservation prevented installation of unrelated templates"
+  || fail "AGENTS.md confirmation prevented installation of unrelated templates"
 python3 - "$agents_target/AGENTS.md" "$TMP_DIR/agents-before.md" <<'PY'
 import sys
 from pathlib import Path
 
 installed, original = map(Path, sys.argv[1:])
-assert installed.read_bytes() == original.read_bytes(), "AGENTS.md bytes changed"
+assert installed.read_bytes() != original.read_bytes(), "explicit y did not change AGENTS.md bytes"
+assert installed.read_bytes().startswith(b"<!-- BEGIN SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->\n"), "managed block was not inserted on the first line"
+assert installed.read_bytes().endswith(original.read_bytes()), "managed insertion did not retain every original byte"
 PY
 
-# An update of a pre-existing managed block must fail closed; its
-# owner, mode, and extended attributes (including ACLs) remain untouched.
+# A confirmed managed update preserves its original owner, mode, and extended
+# attributes (including ACLs), alongside all original maintainer guidance.
 metadata_target="$TMP_DIR/agents-metadata-target"
 mkdir -p "$metadata_target"
 printf '# Preserve file metadata\n' > "$metadata_target/AGENTS.md"
@@ -774,9 +773,13 @@ expected_path.write_text(
     encoding="utf-8",
 )
 PY
-if run_installer_in_pty "$REPO_ROOT/install.sh" "$metadata_target" y "$TMP_DIR/agents-metadata.log"; then
-  fail "installer updated pre-existing AGENTS.md without conditional replacement"
+if run_installer_in_pty "$REPO_ROOT/install.sh" "$metadata_target" n "$TMP_DIR/agents-metadata.log"; then
+  fail "declined AGENTS.md update unexpectedly completed"
+else
+  [[ "$?" == 4 ]] || fail "declined metadata-preservation refusal returned an unexpected status"
 fi
+grep -Fq '[y/N]' "$TMP_DIR/agents-metadata.log" \
+  || fail "metadata-preservation case did not request confirmation in a PTY"
 python3 - "$metadata_target/AGENTS.md" "$TMP_DIR/metadata-expected.json" <<'PY'
 import json
 import os
@@ -841,9 +844,8 @@ if run_installer_in_pty "$REPO_ROOT/install.sh" "$agents_control_target" n "$TMP
 else
   [[ "$?" == 4 ]] || fail "AGENTS.md manual-merge status was not 4"
 fi
-if grep -Fq '[y/N]' "$TMP_DIR/agents-control.log"; then
-  fail "AGENTS.md control-sequence case asked for confirmation"
-fi
+grep -Fq '[y/N]' "$TMP_DIR/agents-control.log" \
+  || fail "AGENTS.md control-sequence case did not request confirmation"
 python3 - "$TMP_DIR/agents-control.log" <<'PY'
 import sys
 from pathlib import Path
@@ -903,12 +905,11 @@ cmp -s "$TMP_DIR/agents-decline-before.md" "$agents_decline_target/AGENTS.md" \
   || fail "declining AGENTS.md insertion changed the file"
 grep -Fq 'merge the reviewed block manually' "$TMP_DIR/agents-decline.log" \
   || fail "AGENTS.md manual merge was not reported"
-if grep -Fq '[y/N]' "$TMP_DIR/agents-decline.log"; then
-  fail "AGENTS.md conflict still displayed a confirmation prompt"
-fi
+grep -Fq '[y/N]' "$TMP_DIR/agents-decline.log" \
+  || fail "AGENTS.md decline case did not display a confirmation prompt"
 
 # A byte-identical AGENTS.md is left alone without a prompt; differing content
-# requires manual merge because a conditional atomic replacement is unavailable.
+# requires explicit confirmation before replacement.
 agents_identical_target="$TMP_DIR/agents-identical-target"
 mkdir -p "$agents_identical_target"
 cp "$REPO_ROOT/AGENTS.md" "$agents_identical_target/AGENTS.md"
@@ -940,18 +941,15 @@ cat > "$agents_target/AGENTS.md" <<'AGENTS'
 # Maintainer-owned guidance
 AGENTS
 cp "$agents_target/AGENTS.md" "$TMP_DIR/agents-update-before.md"
-if run_installer_in_pty "$updated_source/install.sh" "$agents_target" y "$TMP_DIR/agents-update.log"; then
-  fail "installer updated a pre-existing managed block without conditional replacement"
-else
-  [[ "$?" == 4 ]] || fail "unsafe managed-block update did not return incomplete status 4"
+if ! run_installer_in_pty "$updated_source/install.sh" "$agents_target" y "$TMP_DIR/agents-update.log"; then
+  fail "explicit y confirmation did not apply the managed-block update"
 fi
-if grep -Fq '[y/N]' "$TMP_DIR/agents-update.log"; then
-  fail "changed managed block requested a confirmation the installer cannot honor"
-fi
-grep -Fq 'merge the reviewed block manually' "$TMP_DIR/agents-update.log" \
-  || fail "changed managed block did not report the manual merge requirement"
-cmp -s "$TMP_DIR/agents-update-before.md" "$agents_target/AGENTS.md" \
-  || fail "confirmed managed-block update changed AGENTS.md"
+grep -Fq '[y/N]' "$TMP_DIR/agents-update.log" \
+  || fail "changed managed block did not request confirmation"
+grep -Fq "target project's documented validation" "$agents_target/AGENTS.md" \
+  || fail "confirmed managed-block update did not apply the new block"
+grep -Fq '# Maintainer-owned guidance' "$agents_target/AGENTS.md" \
+  || fail "managed-block update removed maintainer-owned guidance"
 
 # Hook-enabled installation rejects non-Git targets; --no-hooks can install there.
 non_git_target="$TMP_DIR/non-git-target"
@@ -1176,5 +1174,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/tests/test-session-start.py"
 PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/tests/test-range-freezer.py"
 PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/tests/test-range-writer.py"
 PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/tests/test-daily-review-temp.py"
+python3 "$REPO_ROOT/tests/test-installer-confirmation.py"
+python3 "$REPO_ROOT/tests/test-installer-confirmation-transaction.py"
 
 echo "PASS: installer safety, hook, session-start, read-only range-freezer, and frozen-range writer regression tests"
