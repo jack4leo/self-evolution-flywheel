@@ -52,6 +52,27 @@ def _call(fn, *args):
     return result
 
 
+def acl_snapshot(fd):
+    get = _native("acl_get_fd_np", ctypes.c_void_p, (ctypes.c_int, ctypes.c_int))
+    to_text = _native("acl_to_text", ctypes.c_void_p,
+                      (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ssize_t)))
+    free = _native("acl_free", ctypes.c_int, (ctypes.c_void_p,))
+    acl = get(fd, 0x100)
+    if not acl:
+        raise OSError(ctypes.get_errno(), "fixture ACL read failed")
+    try:
+        size = ctypes.c_ssize_t()
+        text = to_text(acl, ctypes.byref(size))
+        if not text:
+            raise OSError(ctypes.get_errno(), "fixture ACL serialization failed")
+        try:
+            return ctypes.string_at(text, size.value)
+        finally:
+            free(text)
+    finally:
+        free(acl)
+
+
 def fields(fd):
     s = os.fstat(fd)
     out = {"dev": s.st_dev, "ino": s.st_ino, "nlink": s.st_nlink,
@@ -202,6 +223,7 @@ class AtimeBoundaryTests(unittest.TestCase):
                 self.assertEqual(clone_xattrs, wanted)
                 evidence("fclonefileat", src_before, fields(self.fd), clone=clone_attrs,
                          native_attrs_equal=(source_xattrs == clone_xattrs))
+                self.assertEqual(src_before, fields(self.fd))
             finally:
                 os.close(cfd)
             subprocess.run(
@@ -290,7 +312,7 @@ elif kind == 'acl':
     original = lib.acl_get_fd_np(fd,0x100)
     if not original: raise OSError(ctypes.get_errno(), 'fixture ACL unavailable')
     try:
-        subprocess.run(['chmod','+a','user:root allow read',path],check=True)
+        subprocess.run(['chmod','+a','everyone allow read',path],check=True)
         check(lib.acl_set_fd_np(fd,original,0x100))
     finally: lib.acl_free(original)
 else: raise AssertionError(kind)
@@ -299,8 +321,14 @@ print(json.dumps({'uid':os.getuid(),'pid':os.getpid()}))
         for kind in ("flags", "xattr", "resourcefork", "data", "acl"):
             with self.subTest(kind=kind):
                 self.fresh()
+                if kind == "acl":
+                    # An absent extended ACL returns ENOENT on this runner.
+                    # Seed an explicit ACL before the baseline; never interpret
+                    # a failed ACL read as an empty successful snapshot.
+                    subprocess.run(["chmod", "+a", "user:root allow read", str(self.source)], check=True)
                 original = fields(self.fd)
                 attrs = M.xattrs(self.fd)
+                original_acl = acl_snapshot(self.fd) if kind == "acl" else None
                 actor = json.loads(subprocess.check_output(
                     [sys.executable, "-c", peer, str(self.fd), kind, str(self.source), str(HELPER)],
                     pass_fds=(self.fd,), text=True,
@@ -317,6 +345,8 @@ print(json.dumps({'uid':os.getuid(),'pid':os.getpid()}))
                 self.assertEqual({k: v for k, v in original.items() if k != "ctime_ns"},
                                  {k: v for k, v in after_restore.items() if k != "ctime_ns"})
                 self.assertEqual(M.xattrs(self.fd), attrs)
+                if original_acl is not None:
+                    self.assertEqual(acl_snapshot(self.fd), original_acl)
                 self.assertEqual(os.pread(self.fd, 4096, 0), b"original payload\n" * 64)
 
     def test_acl_write_changes_ctime_without_mode_change(self):
