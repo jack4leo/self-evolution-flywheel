@@ -201,29 +201,24 @@ grep -Fq 'injected transaction journal failure' "$TMP_DIR/journal-failure.log" \
 journal_update_modules="$TMP_DIR/journal-update-modules"
 mkdir -p "$journal_update_modules"
 cat > "$journal_update_modules/sitecustomize.py" <<'PY'
+import json
 import os
 
 _replace = os.replace
-def _fail_nth_journal_update(src, dst, *args, **kwargs):
+def _fail_directory_journal_update(src, dst, *args, **kwargs):
     if os.path.basename(os.fspath(dst)) == "transaction.json":
-        counter = os.environ["JOURNAL_REPLACE_COUNTER"]
-        try:
-            with open(counter, encoding="ascii") as handle:
-                count = int(handle.read())
-        except FileNotFoundError:
-            count = 0
-        count += 1
-        with open(counter, "w", encoding="ascii") as handle:
-            handle.write(str(count))
-        if count == int(os.environ["JOURNAL_FAIL_AT"]):
+        # Target the original scenario, not the incidental number of writes:
+        # publishing now durably records its exact post-link/unlink ctime.
+        with open(src, encoding="utf-8") as handle:
+            state = json.load(handle)
+        if os.environ["JOURNAL_FAIL_DIRECTORY"] in state["created_directories"]:
             raise OSError("injected transaction journal update failure")
     return _replace(src, dst, *args, **kwargs)
-os.replace = _fail_nth_journal_update
+os.replace = _fail_directory_journal_update
 PY
 journal_update_target="$TMP_DIR/journal-update-target"
 init_git_target "$journal_update_target"
-counter_file="$TMP_DIR/journal-update-counter"
-if PYTHONPATH="$journal_update_modules" JOURNAL_REPLACE_COUNTER="$counter_file" JOURNAL_FAIL_AT=6 \
+if PYTHONPATH="$journal_update_modules" JOURNAL_FAIL_DIRECTORY=.agent-maintenance \
     bash "$REPO_ROOT/install.sh" --target "$journal_update_target" > "$TMP_DIR/journal-update.log" 2>&1; then
   fail "installer succeeded after a transaction journal update failure"
 fi

@@ -522,6 +522,34 @@ def same_identity(left, right):
     ))
 
 
+def namespace_identity_matches(actual, before):
+    """Validate only the immediately observed installer-owned link/rename.
+
+    This is not an authorization check for a later read or rollback: callers
+    must persist the exact resulting ctime and use strict identity thereafter.
+    """
+    return bool(actual and before) and actual == {**before, "ctime_ns": actual["ctime_ns"]}
+
+
+def record_published_identity(root, root_fd, relative, parent_fd, name,
+                              temp_fd, expected, operation, state, state_path):
+    """Record a new installer-owned inode after its link/unlink publication.
+
+    A failed observation or journal write leaves the pre-publication version
+    in the durable journal. Strict rollback then preserves uncertain data.
+    Never use this to reauthorize pre-existing files or stale journal entries.
+    """
+    published = identity(temp_fd)
+    if not namespace_identity_matches(published, expected):
+        raise InstallError(f"new file changed during publication; preserved: {relative}")
+    active = signature_at(parent_fd, name)
+    if active != published or not verify_parent(root, root_fd, relative, parent_fd):
+        raise InstallError(f"published pathname or parent changed; preserved: {relative}")
+    operation["expected"] = published
+    operation["status"] = "published"
+    save_state(state_path, state)
+
+
 def read_open_file(fd):
     before = os.fstat(fd)
     if not stat.S_ISREG(before.st_mode):
@@ -754,6 +782,8 @@ def op_copy(root, relative, source, state_path):
         save_state(state_path, state)
         if not verify_parent(root, root_fd, relative, parent_fd):
             raise InstallError(f"target directory moved or changed before publishing; staged file was not installed: {relative}")
+        if identity(temp_fd) != expected:
+            raise InstallError(f"new staging inode changed before publishing: {relative}")
         try:
             os.link(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd, follow_symlinks=False)
         except FileExistsError:
@@ -764,8 +794,14 @@ def op_copy(root, relative, source, state_path):
         if not verify_parent(root, root_fd, relative, parent_fd):
             print(f"PRESERVED file written through a directory moved during publication: {relative}", file=sys.stderr)
             raise InstallError(f"target directory moved during publication; rollback will preserve uncertain data: {relative}")
+        linked = signature_at(parent_fd, name, reject_hardlinks=False)
+        if (linked != identity(temp_fd)
+                or not namespace_identity_matches(linked, {**expected, "nlink": expected["nlink"] + 1})):
+            raise InstallError(f"new file changed at link publication; preserved: {relative}")
         os.unlink(temporary, dir_fd=parent_fd)
         temporary = None
+        record_published_identity(root, root_fd, relative, parent_fd, name,
+                                  temp_fd, expected, operation, state, state_path)
         print("INSTALLED")
     finally:
         if temp_fd is not None:
@@ -1073,6 +1109,8 @@ def op_merge_hook(root, provider, relative, state_path):
         save_state(state_path, state)
         if not verify_parent(root, root_fd, relative, parent_fd):
             raise InstallError(f"target directory moved or changed before publishing settings; staged file was not installed: {relative}")
+        if identity(temp_fd) != expected:
+            raise InstallError(f"new settings staging inode changed before publishing: {relative}")
         try:
             os.link(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd, follow_symlinks=False)
         except FileExistsError:
@@ -1082,8 +1120,14 @@ def op_merge_hook(root, provider, relative, state_path):
         if not verify_parent(root, root_fd, relative, parent_fd):
             print(f"PRESERVED settings written through a directory moved during publication: {relative}", file=sys.stderr)
             raise InstallError(f"target directory moved during settings publication; rollback will preserve uncertain data: {relative}")
+        linked = signature_at(parent_fd, name, reject_hardlinks=False)
+        if (linked != identity(temp_fd)
+                or not namespace_identity_matches(linked, {**expected, "nlink": expected["nlink"] + 1})):
+            raise InstallError(f"new settings changed at link publication; preserved: {relative}")
         os.unlink(temporary, dir_fd=parent_fd)
         temporary = None
+        record_published_identity(root, root_fd, relative, parent_fd, name,
+                                  temp_fd, expected, operation, state, state_path)
         print("HOOK ADDED")
     finally:
         if temp_fd is not None:
@@ -1098,8 +1142,8 @@ def op_merge_hook(root, provider, relative, state_path):
         os.close(root_fd)
 
 
-def signature_at(parent_fd, name):
-    fd = open_existing(parent_fd, name)
+def signature_at(parent_fd, name, *, reject_hardlinks=True):
+    fd = open_existing(parent_fd, name, reject_hardlinks=reject_hardlinks)
     if fd is None:
         return None
     try:
@@ -1150,7 +1194,10 @@ def rollback(root, state_path):
                     incomplete = True
                     continue
                 moved = signature_at(parent_fd, quarantine)
-                if not same_identity(moved, operation["expected"]):
+                # The active name passed the strict ctime check above. Only
+                # this immediately observed rename may account for new ctime;
+                # never apply this comparison to a stale rollback precheck.
+                if not namespace_identity_matches(moved, current):
                     try:
                         os.link(quarantine, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd, follow_symlinks=False)
                     except OSError:
