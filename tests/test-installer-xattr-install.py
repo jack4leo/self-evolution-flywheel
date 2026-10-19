@@ -28,7 +28,7 @@ PTY = load('xattr_install_pty', ROOT / 'tests/test-installer-confirmation.py')
 class XattrInstallTests(unittest.TestCase):
     def test_confirmed_install_and_retry_preserve_real_attributes(self):
         with tempfile.TemporaryDirectory(prefix='xattr-pty-install-') as directory:
-            area = Path(directory)
+            area = Path(directory).resolve()
             project = area / 'project'
             project.mkdir()
             subprocess.run(['git', 'init', '-q', str(project)], check=True)

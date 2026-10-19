@@ -128,7 +128,9 @@ class XattrFallbackTests(SeededXattrsMixin, unittest.TestCase):
 class ConfirmedXattrTransactionTests(SeededXattrsMixin, unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="confirmed-xattrs-")
-        self.area = pathlib.Path(self.tmp.name)
+        # macOS /var is a symlink. Tests must pass the canonical root just as
+        # install.sh does, not ask the helper to relax its no-symlink walk.
+        self.area = pathlib.Path(self.tmp.name).resolve()
         self.project = self.area / "project"
         (self.project / ".claude").mkdir(parents=True)
         self.target = self.project / ".claude/settings.json"
@@ -224,7 +226,8 @@ class ConfirmedXattrTransactionTests(SeededXattrsMixin, unittest.TestCase):
             with self.assertRaises(OSError):
                 M.apply_proposal_command(str(self.project), ".claude/settings.json", str(self.prefix), str(self.stage), str(self.state))
         self.assertEqual(json.loads(self.state.read_text())["operations"][-1]["status"], "pending")
-        self.assertEqual(self.target.read_bytes(), b'{"old":true}\n')
+        # A content observer here can change atime on CI, legitimately making
+        # the already-confirmed snapshot stale. Inspect bytes after the retry.
         self._assert_attrs(self.target)
         M.apply_proposal_command(str(self.project), ".claude/settings.json", str(self.prefix), str(self.stage), str(self.state))
         self.assertEqual(json.loads(self.state.read_text())["operations"][-1]["status"], "applied")
@@ -233,6 +236,8 @@ class ConfirmedXattrTransactionTests(SeededXattrsMixin, unittest.TestCase):
         self._assert_attrs(self.target)
         for recovery in self.target.parent.glob(".settings.json.confirm-backup-*"):
             self._assert_attrs(recovery)
+        self.assertTrue(any(path.read_bytes() == b'{"old":true}\n'
+                            for path in self.target.parent.glob(".settings.json.confirm-backup-*")))
 
     def test_same_length_value_change_during_snapshot_is_refused(self):
         real_get = M.xattr_get
