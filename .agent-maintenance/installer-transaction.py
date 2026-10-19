@@ -315,6 +315,137 @@ def xattr_remove(fd, name):
         raise OSError(error, os.strerror(error), name)
 
 
+def _darwin_acl_functions():
+    if sys.platform != "darwin":
+        return None
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        functions = {name: getattr(libc, name) for name in (
+            "acl_get_fd_np", "acl_set_fd_np", "acl_free", "acl_size",
+            "acl_copy_ext_native", "acl_copy_int_native")}
+    except AttributeError:
+        return None
+    functions["acl_get_fd_np"].argtypes = [ctypes.c_int, ctypes.c_int]
+    functions["acl_get_fd_np"].restype = ctypes.c_void_p
+    functions["acl_set_fd_np"].argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+    functions["acl_set_fd_np"].restype = ctypes.c_int
+    functions["acl_free"].argtypes = [ctypes.c_void_p]
+    functions["acl_free"].restype = ctypes.c_int
+    functions["acl_size"].argtypes = [ctypes.c_void_p]
+    functions["acl_size"].restype = ctypes.c_ssize_t
+    functions["acl_copy_ext_native"].argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+    functions["acl_copy_ext_native"].restype = ctypes.c_ssize_t
+    functions["acl_copy_int_native"].argtypes = [ctypes.c_void_p]
+    functions["acl_copy_int_native"].restype = ctypes.c_void_p
+    return functions
+
+
+_DARWIN_ACL_TYPE_EXTENDED = 0x00000100
+
+
+def _darwin_acl(fd):
+    functions = _darwin_acl_functions()
+    if functions is None:
+        if sys.platform == "darwin":
+            raise OSError(errno.ENOTSUP, "Darwin ACL APIs unavailable")
+        return {"supported": False, "present": False, "value": None}
+    ctypes.set_errno(0)
+    acl = functions["acl_get_fd_np"](fd, _DARWIN_ACL_TYPE_EXTENDED)
+    if not acl:
+        error = ctypes.get_errno()
+        if error == errno.ENOENT:
+            return {"supported": True, "present": False, "value": None}
+        raise OSError(error or errno.EIO, os.strerror(error or errno.EIO), "acl_get_fd_np")
+    try:
+        size = functions["acl_size"](acl)
+        if size <= 0:
+            raise OSError(errno.EIO, "invalid Darwin ACL size")
+        buffer = ctypes.create_string_buffer(size)
+        copied = functions["acl_copy_ext_native"](buffer, acl, size)
+        if copied != size:
+            raise OSError(errno.EIO, "Darwin ACL serialization size mismatch")
+        return {"supported": True, "present": True, "value": base64.b64encode(buffer.raw[:size]).decode("ascii")}
+    finally:
+        functions["acl_free"](acl)
+
+
+def _darwin_set_acl(fd, value):
+    if sys.platform != "darwin":
+        if value.get("supported") or value.get("present"):
+            raise OSError(errno.ENOTSUP, "cannot apply Darwin ACL on this platform")
+        return
+    functions = _darwin_acl_functions()
+    if functions is None:
+        raise OSError(errno.ENOTSUP, "Darwin ACL APIs unavailable")
+    if not value.get("present"):
+        # acl_set_fd_np cannot portably encode absence; verify absence instead.
+        actual = _darwin_acl(fd)
+        if actual["present"]:
+            raise OSError(errno.EPERM, "cannot safely remove existing Darwin ACL")
+        return
+    raw = base64.b64decode(value["value"], validate=True)
+    # acl_copy_int_native has no length argument. Validate the kauth_filesec
+    # header and complete ACE area before handing the pointer to libc.
+    import struct
+    if len(raw) < 44 or len(raw) > 1024 * 1024 or len(raw) % 4:
+        raise OSError(errno.EINVAL, "invalid Darwin ACL serialization length")
+    magic = struct.unpack_from("=I", raw, 0)[0]
+    entry_count = struct.unpack_from("=I", raw, 36)[0]
+    if magic != 0x012CC16D or entry_count > 128:
+        raise OSError(errno.EINVAL, "invalid Darwin ACL serialization header")
+    # kauth_filesec contains magic, owner/group GUIDs, and kauth_acl header;
+    # each kauth_ace is 24 bytes.
+    expected = 44 + entry_count * 24
+    if len(raw) != expected:
+        raise OSError(errno.EINVAL, "invalid Darwin ACL serialization entry area")
+    buffer = ctypes.create_string_buffer(raw)
+    acl = functions["acl_copy_int_native"](buffer)
+    if not acl:
+        error = ctypes.get_errno()
+        raise OSError(error or errno.EIO, os.strerror(error or errno.EIO), "acl_copy_int_native")
+    try:
+        if functions["acl_set_fd_np"](fd, acl, _DARWIN_ACL_TYPE_EXTENDED) != 0:
+            error = ctypes.get_errno()
+            raise OSError(error or errno.EIO, os.strerror(error or errno.EIO), "acl_set_fd_np")
+    finally:
+        functions["acl_free"](acl)
+
+
+def _file_flags(fd):
+    info = os.fstat(fd)
+    value = getattr(info, "st_flags", None)
+    if value is None:
+        if sys.platform == "darwin":
+            raise OSError(errno.ENOTSUP, "Darwin st_flags unavailable")
+        return {"supported": False, "value": None}
+    return {"supported": True, "value": int(value)}
+
+
+def _set_file_flags(fd, flags):
+    if not flags.get("supported"):
+        return
+    # Never mask immutable/append/nounlink/unknown flags or leave staging with
+    # flags that prevent a safe exchange or recovery.
+    if flags["value"] & ~(0x00000001 | 0x00008000):  # UF_NODUMP | UF_HIDDEN
+        raise OSError(errno.ENOTSUP, "cannot safely stage these BSD file flags")
+    function = getattr(ctypes.CDLL(None, use_errno=True), "fchflags", None)
+    if function is None:
+        raise OSError(errno.ENOTSUP, "fchflags unavailable")
+    function.argtypes = [ctypes.c_int, ctypes.c_uint]
+    function.restype = ctypes.c_int
+    if function(fd, flags["value"]) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error or errno.EIO, os.strerror(error or errno.EIO), "fchflags")
+
+
+def protected_metadata(fd):
+    return {"acl": _darwin_acl(fd), "flags": _file_flags(fd)}
+
+
+def metadata_matches(left, right):
+    return left == right
+
+
 def xattrs(fd):
     if _xattr_api() is None:
         return None
@@ -357,18 +488,19 @@ def identity(fd):
               "st_nlink", "st_ctime_ns")
     if any(getattr(before, name) != getattr(after, name) for name in stable):
         raise InstallError("file changed while it was being inspected")
-    if after.st_atime_ns != before.st_atime_ns:
-        os.utime(fd, ns=(before.st_atime_ns, before.st_mtime_ns))
-        after = os.fstat(fd)
     attributes = xattrs(fd)
+    protected = protected_metadata(fd)
+    verified_protected = protected_metadata(fd)
     final = os.fstat(fd)
-    if any(getattr(after, name) != getattr(final, name) for name in stable):
-        raise InstallError("file changed while its extended attributes were inspected")
+    if any(getattr(after, name) != getattr(final, name) for name in stable) or protected != verified_protected:
+        raise InstallError("file changed while its extended attributes or protected metadata were inspected")
     return {
         "device": after.st_dev,
         "inode": after.st_ino,
         "size": after.st_size,
+        "nlink": after.st_nlink,
         "mtime_ns": after.st_mtime_ns,
+        "ctime_ns": after.st_ctime_ns,
         "mode": stat.S_IMODE(after.st_mode),
         "uid": after.st_uid,
         "gid": after.st_gid,
@@ -376,6 +508,7 @@ def identity(fd):
         "xattrs": None if attributes is None else hashlib.sha256(
             json.dumps(attributes, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest(),
+        "protected": protected,
     }
 
 
@@ -385,14 +518,16 @@ def same_identity(left, right):
     if not left or not right or left.get("xattrs") is None or right.get("xattrs") is None:
         return False
     return all(left.get(key) == right.get(key) for key in (
-        "device", "inode", "size", "mtime_ns", "mode", "uid", "gid", "sha256", "xattrs"
+        "device", "inode", "size", "nlink", "mtime_ns", "ctime_ns", "mode", "uid", "gid", "sha256", "xattrs", "protected"
     ))
 
 
-def read_open_file(fd, preserve_times=True):
-    info = os.fstat(fd)
-    if not stat.S_ISREG(info.st_mode):
+def read_open_file(fd):
+    before = os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode):
         raise InstallError("settings path is not a regular file")
+    before_protected = protected_metadata(fd)
+    before_xattrs = xattrs(fd)
     os.lseek(fd, 0, os.SEEK_SET)
     chunks = []
     while True:
@@ -400,10 +535,14 @@ def read_open_file(fd, preserve_times=True):
         if not chunk:
             break
         chunks.append(chunk)
-    data = b"".join(chunks)
-    if preserve_times and os.fstat(fd).st_atime_ns != info.st_atime_ns:
-        os.utime(fd, ns=(info.st_atime_ns, info.st_mtime_ns))
-    return data
+    after_protected = protected_metadata(fd)
+    after_xattrs = xattrs(fd)
+    after = os.fstat(fd)
+    stable = ("st_dev", "st_ino", "st_size", "st_mode", "st_uid", "st_gid", "st_nlink", "st_mtime_ns", "st_ctime_ns")
+    if (any(getattr(before, field) != getattr(after, field) for field in stable)
+            or before_protected != after_protected or before_xattrs != after_xattrs):
+        raise InstallError("file or protected metadata changed while it was being read")
+    return b"".join(chunks)
 
 
 def open_existing(parent_fd, name, reject_hardlinks=True):
@@ -442,6 +581,11 @@ def inspect_existing(parent_fd, name, allow_hardlinks=False):
 
 def apply_metadata(fd, values):
     try:
+        wanted_protected = values.get("protected")
+        if wanted_protected is None:
+            # New files inherit the directory's security policy, not an
+            # assumed empty ACL. Replacements always provide a full baseline.
+            wanted_protected = protected_metadata(fd)
         if (os.fstat(fd).st_uid, os.fstat(fd).st_gid) != (values["uid"], values["gid"]):
             os.fchown(fd, values["uid"], values["gid"])
         os.fchmod(fd, values["mode"])
@@ -449,6 +593,7 @@ def apply_metadata(fd, values):
             name: base64.b64decode(value)
             for name, value in values.get("xattrs", {}).items()
         }
+        _set_file_flags(fd, wanted_protected["flags"])
         if _xattr_api() is not None:
             for name in xattr_list(fd):
                 if name not in wanted:
@@ -462,14 +607,16 @@ def apply_metadata(fd, values):
             # A new transaction-owned staging file requests no xattrs; core
             # mode/owner/time metadata can still be applied safely.
             actual = None
-        os.utime(fd, ns=(values["atime_ns"], values["mtime_ns"]))
+        os.utime(fd, ns=(os.fstat(fd).st_atime_ns, values["mtime_ns"]))
+        _set_file_flags(fd, wanted_protected["flags"])
+        _darwin_set_acl(fd, wanted_protected["acl"])
         info = os.fstat(fd)
         if (
             (info.st_uid, info.st_gid) != (values["uid"], values["gid"])
             or stat.S_IMODE(info.st_mode) != values["mode"]
-            or info.st_atime_ns != values["atime_ns"]
             or info.st_mtime_ns != values["mtime_ns"]
             or (actual is not None and actual != values.get("xattrs", {}))
+            or protected_metadata(fd) != wanted_protected
         ):
             raise OSError("staged file metadata did not match the original")
     except (OSError, AttributeError, NotImplementedError) as exc:
@@ -497,7 +644,6 @@ def new_temp(parent_fd, name, data, values, temporary_name=None, preserve_on_fai
         apply_metadata(fd, values)
         os.fsync(fd)
         expected = identity(fd)
-        os.utime(fd, ns=(values["atime_ns"], values["mtime_ns"]))
         return temporary, fd, expected
     except Exception:
         os.close(fd)
@@ -525,9 +671,9 @@ def source_file(path):
             "mode": stat.S_IMODE(info.st_mode),
             "uid": info.st_uid,
             "gid": info.st_gid,
-            "atime_ns": info.st_atime_ns,
             "mtime_ns": info.st_mtime_ns,
             "xattrs": {},
+            "protected": protected_metadata(fd),
         }
         return data, values
     finally:
@@ -1068,21 +1214,23 @@ def confirmation_snapshot(fd, parent_fd):
     data = read_open_file(fd)
     after = os.fstat(fd)
     fields = ("st_dev", "st_ino", "st_size", "st_mode", "st_uid", "st_gid",
-              "st_nlink", "st_atime_ns", "st_mtime_ns", "st_ctime_ns")
+              "st_nlink", "st_mtime_ns", "st_ctime_ns")
     if any(getattr(before, field) != getattr(after, field) for field in fields):
         raise InstallError("file changed while the confirmation snapshot was read")
     attrs = xattrs(fd)
+    protected = protected_metadata(fd)
+    verified_protected = protected_metadata(fd)
     final = os.fstat(fd)
-    if any(getattr(after, field) != getattr(final, field) for field in fields):
+    if any(getattr(after, field) != getattr(final, field) for field in fields) or protected != verified_protected:
         raise InstallError("file changed while the confirmation attributes were read")
     return {
         "inode": {"device": after.st_dev, "number": after.st_ino, "nlink": after.st_nlink},
         "content": {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data)},
         "metadata": {
             "mode": stat.S_IMODE(after.st_mode), "uid": after.st_uid, "gid": after.st_gid,
-            "atime_ns": after.st_atime_ns, "mtime_ns": after.st_mtime_ns,
-            "ctime_ns": after.st_ctime_ns,
+            "mtime_ns": after.st_mtime_ns, "ctime_ns": after.st_ctime_ns,
             "xattrs": attrs if attrs is not None else {},
+            "protected": protected,
             "xattrs_supported": attrs is not None,
         },
         "parent": {"device": os.fstat(parent_fd).st_dev, "number": os.fstat(parent_fd).st_ino},
@@ -1097,18 +1245,22 @@ def validate_confirmation_path(relative):
         raise InstallError(f"confirmation transactions are not permitted for {relative!r}")
 
 
-def confirmation_identity_matches(actual, expected):
-    """Compare a pathname after rename without treating rename's ctime as data drift."""
+def confirmation_identity_matches(actual, expected, allow_exchange_ctime=False):
+    """Strictly compare identity; only the existing exchange boundary may waive ctime."""
     if not actual or not expected:
         return False
     for section, fields in (
-        ("inode", ("device", "number")),
+        ("inode", ("device", "number", "nlink")),
         ("content", ("sha256", "size")),
-        ("metadata", ("mode", "uid", "gid", "atime_ns", "mtime_ns", "xattrs", "xattrs_supported")),
+        ("parent", ("device", "number")),
+        ("metadata", ("mode", "uid", "gid", "mtime_ns", "ctime_ns", "xattrs", "xattrs_supported", "protected")),
     ):
         left, right = actual.get(section, {}), expected.get(section, {})
-        if any(left.get(field) != right.get(field) for field in fields):
-            return False
+        for field in fields:
+            if field == "ctime_ns" and allow_exchange_ctime:
+                continue
+            if left.get(field) != right.get(field):
+                return False
     return True
 
 
@@ -1175,8 +1327,47 @@ def rename_exchange(parent_fd, left, right):
         raise OSError(error, os.strerror(error), right)
 
 
-def apply_proposal_command(root, relative, prefix, staged, state_path):
+def proposal_material_snapshot(path):
+    parent = os.open(os.path.dirname(os.path.abspath(path)), DIR_FLAGS | NOFOLLOW)
+    fd = None
+    try:
+        fd = open_existing(parent, os.path.basename(path), reject_hardlinks=True)
+        if fd is None:
+            raise InstallError("proposal material disappeared")
+        return confirmation_snapshot(fd, parent)
+    finally:
+        if fd is not None:
+            os.close(fd)
+        os.close(parent)
+
+
+def proposal_material_command(prefix, staged, verify=False):
+    with open(prefix + ".identity.json", encoding="utf-8") as handle:
+        original_expected = json.load(handle)
+    baseline, baseline_data = proposal_material_snapshot(prefix + ".original")
+    proposed, _ = proposal_material_snapshot(staged)
+    if hashlib.sha256(baseline_data).hexdigest() != original_expected["content"]["sha256"]:
+        raise InstallError("display baseline no longer matches the original proposal")
+    material = {"baseline": baseline, "proposed": proposed}
+    manifest = prefix + ".display.json"
+    if verify:
+        with open(manifest, encoding="utf-8") as handle:
+            if json.load(handle) != material:
+                raise InstallError("displayed proposal material changed; refusing confirmation")
+    else:
+        _write_bytes_atomic(manifest, (json.dumps(material, sort_keys=True) + "\n").encode())
+    return material
+
+
+def apply_proposal_command(root, relative, prefix, staged, state_path, require_display_manifest=False):
     validate_confirmation_path(relative)
+    if require_display_manifest:
+        displayed = proposal_material_command(prefix, staged, verify=True)
+    else:
+        # Direct Python callers are trusted authorizers of their supplied bytes
+        # (as documented at this module's entry); the shell CLI must prove the
+        # version shown on the terminal, rather than authorizing bytes afresh.
+        displayed = None
     try:
         with open(prefix + ".identity.json", encoding="utf-8") as handle:
             expected = json.load(handle)
@@ -1210,6 +1401,17 @@ def apply_proposal_command(root, relative, prefix, staged, state_path):
         if not stat.S_ISREG(stage_info.st_mode) or stage_info.st_nlink != 1:
             raise InstallError("staged file must be a regular file with exactly one link")
         stage_data = read_open_file(stage_fd)
+        if displayed is not None:
+            stage_parent = os.open(os.path.dirname(os.path.abspath(staged)), DIR_FLAGS | NOFOLLOW)
+            try:
+                stage_snapshot, _ = confirmation_snapshot(stage_fd, stage_parent)
+            finally:
+                os.close(stage_parent)
+            proposed_content = displayed["proposed"]["content"]
+            if (stage_snapshot != displayed["proposed"]
+                    or len(stage_data) != proposed_content["size"]
+                    or hashlib.sha256(stage_data).hexdigest() != proposed_content["sha256"]):
+                raise InstallError("staged file is not the displayed version")
         stage_after = os.fstat(stage_fd)
         if stage_after.st_size != len(stage_data) or stage_after.st_ino != stage_info.st_ino:
             raise InstallError("staged file changed while being read")
@@ -1250,10 +1452,29 @@ def apply_proposal_command(root, relative, prefix, staged, state_path):
             "confirmation_backup": backup,
         })
         save_state(state_path, state)
-        os.close(temp_fd)
-        temp_fd = None
+        # Staging and journal I/O must not open an unchecked target/version
+        # window. Re-open both names after that work and keep the staging fd
+        # pinned through exchange. This narrows, but is not a namespace CAS.
+        latest_fd = open_existing(parent_fd, name, reject_hardlinks=True)
+        staged_name_fd = open_existing(parent_fd, backup, reject_hardlinks=True)
+        try:
+            if latest_fd is None or staged_name_fd is None:
+                raise InstallError("confirmed or staged inode disappeared before exchange")
+            final_target, _ = confirmation_snapshot(latest_fd, parent_fd)
+            final_stage, _ = confirmation_snapshot(staged_name_fd, parent_fd)
+            if final_target != expected or final_stage != new_expected:
+                raise InstallError("confirmed or staged version changed before exchange")
+            if not verify_parent(root, root_fd, relative, parent_fd):
+                raise InstallError("target parent changed before exchange")
+        finally:
+            if latest_fd is not None:
+                os.close(latest_fd)
+            if staged_name_fd is not None:
+                os.close(staged_name_fd)
         rename_exchange(parent_fd, name, backup)
         exchanged = True
+        os.close(temp_fd)
+        temp_fd = None
 
         # ctime changes on rename, so compare all stable identity/data fields
         # while explicitly retaining inode identity and the displaced bytes.
@@ -1271,9 +1492,9 @@ def apply_proposal_command(root, relative, prefix, staged, state_path):
                 os.close(displaced_fd)
             if active_fd is not None:
                 os.close(active_fd)
-        if not confirmation_identity_matches(displaced, expected):
+        if not confirmation_identity_matches(displaced, expected, allow_exchange_ctime=True):
             raise InstallError("exchange displaced inode or data did not match the confirmed original")
-        if not confirmation_identity_matches(active, new_expected):
+        if not confirmation_identity_matches(active, new_expected, allow_exchange_ctime=True):
             raise InstallError("active pathname does not contain the staged inode or data")
         if not verify_parent(root, root_fd, relative, parent_fd):
             raise InstallError("target parent moved after confirmed update; recovery entries preserved")
@@ -1324,8 +1545,12 @@ def main(argv):
             snapshot_command(argv[1], argv[2], argv[3])
         elif command == "proposal" and len(argv) == 4:
             proposal_command(argv[1], argv[2], argv[3])
+        elif command == "seal-display" and len(argv) == 3:
+            proposal_material_command(argv[1], argv[2])
+        elif command == "verify-display" and len(argv) == 3:
+            proposal_material_command(argv[1], argv[2], verify=True)
         elif command == "apply-proposal" and len(argv) == 6:
-            apply_proposal_command(argv[1], argv[2], argv[3], argv[4], argv[5])
+            apply_proposal_command(argv[1], argv[2], argv[3], argv[4], argv[5], require_display_manifest=True)
         elif command == "compare" and len(argv) == 4:
             return compare_command(argv[1], argv[2], argv[3])
         elif command == "copy" and len(argv) == 5:

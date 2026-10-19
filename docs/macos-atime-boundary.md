@@ -1,6 +1,8 @@
 # macOS 确认写入为什么仍被阻断
 
-**PR #30 必须保持 OPEN / DRAFT，不能宣称 Mac 安装已修复。** 原生 fd xattr 兼容层已通过真实 macOS 的属性读写测试，但确认写入仍被另一项基线问题阻断：读取原件会改变访问时间（atime）；恢复 atime 又会改变元数据变更时间（ctime）。不能把新的 ctime 当成本进程造成而直接接受，否则会失去对并发修改的证据。
+> **历史记录，非当前读取契约。** 本文记录 PR #30 在不允许 atime 变化时的调查；维护者后来将它合并到 `main` 的 `9318f16a11c581661913d17b7371a108dc0e5154`。随后用户明确允许读取自然更新 atime，并要求不恢复它。新分支的实现、严格 ctime 安全门及尚未解决的交换边界见 [installer-atime-contract.md](installer-atime-contract.md)。下文的“当前”“本次”“不修改生产 helper”和“必须保留 atime”等均描述当时范围，不是新分支的现状或要求。
+
+**PR #30 调查时不能宣称 Mac 安装已修复。** 原生 fd xattr 兼容层已通过真实 macOS 的属性读写测试，但确认写入仍被另一项基线问题阻断：读取原件会改变访问时间（atime）；恢复 atime 又会改变元数据变更时间（ctime）。不能把新的 ctime 当成本进程造成而直接接受，否则会失去对并发修改的证据。
 
 [已有真实 macOS 对照](https://github.com/jack4leo/self-evolution-flywheel/actions/runs/39217885934/job/117945947718)显示，原 main `9d04f1b4939f53125f92b718ad8d908b744ffc80` 与 PR `ca1ba0637e8c61d449a11df3162fd50fa600784e` 都在同一快照边界拒绝。打印出的字段只有 `st_ctime_ns` 发生变化；Mac 安装、确认与恢复测试仍失败。这不是 Python xattr 回退失败，也不是跨平台验证通过。
 

@@ -120,7 +120,7 @@ class AtimeBoundaryTests(unittest.TestCase):
         os.utime(self.fd, ns=(old, old + 1234))
         return old
 
-    def test_real_read_restore_atime_changes_ctime_and_helper_fails_closed(self):
+    def test_real_read_restore_atime_changes_ctime_snapshot_remains_observable(self):
         self.fresh()
         before = fields(self.fd)
         os.read(self.fd, 32)
@@ -130,8 +130,9 @@ class AtimeBoundaryTests(unittest.TestCase):
         self.assertNotEqual(before["ctime_ns"], after["ctime_ns"])
         parent = os.open(self.area, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            with self.assertRaises(M.InstallError):
-                M.confirmation_snapshot(self.fd, parent)
+            snapshot, data = M.confirmation_snapshot(self.fd, parent)
+            self.assertEqual(snapshot["content"]["size"], len(data))
+            self.assertEqual(snapshot["metadata"]["ctime_ns"], after["ctime_ns"])
         finally:
             os.close(parent)
 
