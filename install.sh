@@ -251,11 +251,14 @@ preflight_hook_config() {
 import json
 import errno
 import os
+import runpy
 import stat
 import subprocess
 import sys
 
 provider, filename, target_dir, helper = sys.argv[1:]
+sys.dont_write_bytecode = True
+read_xattrs = runpy.run_path(helper)["xattrs"]
 
 def open_checked_settings(path, expected):
     nofollow = getattr(os, "O_NOFOLLOW", None)
@@ -314,11 +317,9 @@ try:
                 )
         handle, opened = open_checked_settings(filename, info)
         try:
-            listxattr = getattr(os, "listxattr", None)
-            getxattr = getattr(os, "getxattr", None)
-            if listxattr is not None and getxattr is not None:
-                for name in listxattr(handle.fileno()):
-                    getxattr(handle.fileno(), name)
+            # Use exactly the same fd-only backend as confirmation snapshots,
+            # staged metadata verification, identity checks and recovery.
+            read_xattrs(handle.fileno())
             try:
                 config = json.load(handle)
             finally:

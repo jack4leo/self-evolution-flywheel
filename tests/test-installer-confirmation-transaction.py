@@ -27,7 +27,7 @@ def run(*args, cwd=None):
 class ConfirmationTransactionTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="confirm-transaction-")
-        self.area = pathlib.Path(self.tmp.name)
+        self.area = pathlib.Path(self.tmp.name).resolve()
         self.project = self.area / "project"
         (self.project / ".claude").mkdir(parents=True)
         self.target = self.project / ".claude/settings.json"
