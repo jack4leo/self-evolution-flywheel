@@ -539,7 +539,8 @@ grep -Fq 'settings file is a symbolic link' "$TMP_DIR/settings-link.log" \
   || fail "settings symlink rejection was not clear"
 
 # Existing hook JSON that would need modification is preserved without blocking
-# template files; its content, ownership, mode, timestamps and xattrs stay intact.
+# template files; content, ownership, mode, mtime, ctime and xattrs stay intact.
+# Read-only preflight/proposals may naturally update atime, even without a TTY.
 hook_metadata_target="$TMP_DIR/hook-metadata-target"
 init_git_target "$hook_metadata_target"
 mkdir -p "$hook_metadata_target/.claude"
@@ -628,7 +629,7 @@ finally:
 assert actual_bytes == original_path.read_bytes(), "safe refusal changed existing settings bytes"
 assert (info.st_uid, info.st_gid) == (expected["uid"], expected["gid"]), "hook settings owner or group changed"
 assert stat.S_IMODE(info.st_mode) == expected["mode"], "hook settings permissions changed"
-assert info.st_atime_ns == expected["atime_ns"], "hook settings atime changed"
+# atime is the sole permitted read side effect; it is not restored or compared.
 assert info.st_mtime_ns == expected["mtime_ns"], "hook settings mtime changed"
 assert info.st_ctime_ns == expected["ctime_ns"], "hook settings ctime changed"
 actual = {name: os.getxattr(filename, name).hex() for name in os.listxattr(filename)}
@@ -1178,4 +1179,7 @@ python3 "$REPO_ROOT/tests/test-installer-confirmation.py"
 python3 "$REPO_ROOT/tests/test-installer-confirmation-transaction.py"
 python3 "$REPO_ROOT/tests/test-installer-xattrs.py"
 python3 "$REPO_ROOT/tests/test-installer-xattr-install.py"
+python3 "$REPO_ROOT/tests/test-installer-atime-contract.py"
+python3 "$REPO_ROOT/tests/test-installer-atime-interaction.py"
+python3 "$REPO_ROOT/tests/test-macos-metadata-contract.py"
 echo "PASS: installer safety, hook, session-start, read-only range-freezer, and frozen-range writer regression tests"

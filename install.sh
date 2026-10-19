@@ -32,6 +32,8 @@ Existing Codex JSON still requires a manual merge. Exact hooks are accepted,
 missing settings files are created, and declining a settings merge skips only
 that provider; the other provider is still validated independently.
 Other template files are still installed when both settings files are valid.
+Reading existing files (including previews, N, EOF or no terminal) may update
+their access time. The installer never restores atime on existing files.
 
 Options:
   --target DIR              Destination project root (default: current directory)
@@ -258,7 +260,9 @@ import sys
 
 provider, filename, target_dir, helper = sys.argv[1:]
 sys.dont_write_bytecode = True
-read_xattrs = runpy.run_path(helper)["xattrs"]
+protocol = runpy.run_path(helper)
+read_xattrs = protocol["xattrs"]
+read_open_file = protocol["read_open_file"]
 
 def open_checked_settings(path, expected):
     nofollow = getattr(os, "O_NOFOLLOW", None)
@@ -320,14 +324,14 @@ try:
             # Use exactly the same fd-only backend as confirmation snapshots,
             # staged metadata verification, identity checks and recovery.
             read_xattrs(handle.fileno())
-            try:
-                config = json.load(handle)
-            finally:
-                if os.fstat(handle.fileno()).st_atime_ns != opened.st_atime_ns:
-                    os.utime(
-                        handle.fileno(),
-                        ns=(opened.st_atime_ns, opened.st_mtime_ns),
-                    )
+            config = json.loads(read_open_file(handle.fileno()).decode("utf-8"))
+            after = os.fstat(handle.fileno())
+            # Only natural access-time changes are permitted. Never utime an
+            # existing inode: restoring atime would manufacture a new ctime.
+            protected = ("st_dev", "st_ino", "st_size", "st_mode", "st_uid",
+                         "st_gid", "st_nlink", "st_mtime_ns", "st_ctime_ns")
+            if any(getattr(opened, key) != getattr(after, key) for key in protected):
+                raise OSError("settings changed during structural preflight")
         finally:
             handle.close()
     else:
@@ -454,14 +458,17 @@ fi
 # Detect predictable destination permission failures before writing any template
 # files or provider settings. This checks only paths that would actually change.
 preflight_write_access() {
-  python3 - "$SOURCE_DIR" "$TARGET_DIR" "$CODEX_HOOKS_ENABLED" "$((CLAUDE_HOOKS_ENABLED || CLAUDE_MERGE_PROPOSAL))" "${files[@]}" <<'PY'
+  python3 - "$SOURCE_DIR" "$TARGET_DIR" "$TRANSACTION_HELPER" "$CODEX_HOOKS_ENABLED" "$((CLAUDE_HOOKS_ENABLED || CLAUDE_MERGE_PROPOSAL))" "${files[@]}" <<'PY'
 import json
 import errno
 import os
+import runpy
 import stat
 import sys
 
-source_dir, target_dir, codex_hooks_enabled, claude_hooks_enabled, *relative_files = sys.argv[1:]
+source_dir, target_dir, helper, codex_hooks_enabled, claude_hooks_enabled, *relative_files = sys.argv[1:]
+sys.dont_write_bytecode = True
+read_open_file = runpy.run_path(helper)["read_open_file"]
 needed_directories = set()
 
 def open_checked_settings(path, expected):
@@ -523,14 +530,12 @@ if codex_hooks_enabled == "1" or claude_hooks_enabled == "1":
                     raise OSError("settings path is not a regular file")
                 handle, opened = open_checked_settings(filename, expected)
                 try:
-                    try:
-                        config = json.load(handle)
-                    finally:
-                        if os.fstat(handle.fileno()).st_atime_ns != opened.st_atime_ns:
-                            os.utime(
-                                handle.fileno(),
-                                ns=(opened.st_atime_ns, opened.st_mtime_ns),
-                            )
+                    config = json.loads(read_open_file(handle.fileno()).decode("utf-8"))
+                    after = os.fstat(handle.fileno())
+                    protected = ("st_dev", "st_ino", "st_size", "st_mode", "st_uid",
+                                 "st_gid", "st_nlink", "st_mtime_ns", "st_ctime_ns")
+                    if any(getattr(opened, key) != getattr(after, key) for key in protected):
+                        raise OSError("settings changed during write-access preflight")
                 finally:
                     handle.close()
             except Exception as exc:
@@ -624,7 +629,9 @@ cat > "$managed_route_file" <<'ROUTE'
 ROUTE
 
 display_managed_diff() {
-  python3 - "$1" "$2" "${3:-AGENTS.md}" <<'PY'
+  local status=0
+  python3 "$TRANSACTION_HELPER" seal-display "$4" "$2" || return 2
+  python3 - "$1" "$2" "${3:-AGENTS.md}" <<'PY' || status=$?
 import subprocess
 import sys
 import unicodedata
@@ -666,6 +673,9 @@ for line in iter(process.stdout.readline, b""):
 process.stdout.close()
 sys.exit(process.wait())
 PY
+  ((status <= 1)) || return "$status"
+  python3 "$TRANSACTION_HELPER" verify-display "$4" "$2" || return 2
+  return "$status"
 }
 
 # Never read script stdin: it can still contain a curl-piped installer. Require
@@ -773,7 +783,7 @@ PY
   fi
 
   echo "Proposed diff for AGENTS.md (no changes applied yet):"
-  display_managed_diff "$baseline" "$stage_file" || diff_status=$?
+  display_managed_diff "$baseline" "$stage_file" "AGENTS.md" "$proposal" || diff_status=$?
   if ((diff_status > 1)); then
     echo "PRESERVED existing file (could not display the proposed diff): AGENTS.md" >&2
     rm -f "$stage_file"
@@ -968,7 +978,7 @@ PY
     return 0
   fi
   echo "Proposed diff for .claude/settings.json (no changes applied yet):"
-  display_managed_diff "$proposal.original" "$stage_file" ".claude/settings.json" || diff_status=$?
+  display_managed_diff "$proposal.original" "$stage_file" ".claude/settings.json" "$proposal" || diff_status=$?
   ((diff_status <= 1)) || return 3
   if ! confirm_proposal ".claude/settings.json"; then
     return 11

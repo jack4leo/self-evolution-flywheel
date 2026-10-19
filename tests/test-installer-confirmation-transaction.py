@@ -50,6 +50,8 @@ class ConfirmationTransactionTests(unittest.TestCase):
         result = run("proposal", self.project, ".claude/settings.json", self.prefix)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((self.prefix.parent / "settings.original").is_file())
+        result = run("seal-display", self.prefix, self.stage)
+        self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads((self.prefix.parent / "settings.identity.json").read_text())
 
     def test_proposal_apply_preserves_original_metadata_and_leaves_recovery(self):
@@ -104,6 +106,70 @@ class ConfirmationTransactionTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("Traceback", result.stderr)
         self.assertEqual(self.target.read_bytes(), b'{"user":true}\n')
+
+    def test_missing_display_manifest_is_rejected_without_traceback(self):
+        self.propose()
+        (self.prefix.parent / "settings.display.json").unlink()
+        result = run("apply-proposal", self.project, ".claude/settings.json", self.prefix, self.stage, self.state)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(self.target.read_bytes(), b'{"user":true}\n')
+
+    def test_same_length_stage_bytes_restored_with_mtime_but_changed_ctime_is_refused(self):
+        self.propose()
+        before = self.stage.stat()
+        original = self.stage.read_bytes()
+        changed = bytes((original[0] ^ 1,)) + original[1:]
+        self.stage.write_bytes(changed)
+        os.utime(self.stage, ns=(before.st_atime_ns, before.st_mtime_ns))
+        self.stage.write_bytes(original)
+        os.utime(self.stage, ns=(before.st_atime_ns, before.st_mtime_ns))
+        self.assertEqual(self.stage.read_bytes(), original)
+        self.assertNotEqual(self.stage.stat().st_ctime_ns, before.st_ctime_ns)
+        result = run("apply-proposal", self.project, ".claude/settings.json", self.prefix, self.stage, self.state)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(self.target.read_bytes(), b'{"user":true}\n')
+
+    def test_stage_inode_replacement_with_same_payload_and_metadata_is_refused(self):
+        self.propose()
+        before = self.stage.stat()
+        replacement = self.stage.with_name("stage-replacement")
+        replacement.write_bytes(self.stage.read_bytes())
+        os.chmod(replacement, before.st_mode & 0o7777)
+        os.utime(replacement, ns=(before.st_atime_ns, before.st_mtime_ns))
+        replacement.replace(self.stage)
+        result = run("apply-proposal", self.project, ".claude/settings.json", self.prefix, self.stage, self.state)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(self.target.read_bytes(), b'{"user":true}\n')
+
+    def test_sealed_baseline_restore_with_changed_ctime_is_refused(self):
+        self.propose()
+        baseline = self.prefix.parent / "settings.original"
+        before = baseline.stat()
+        original = baseline.read_bytes()
+        baseline.write_bytes(b"x" + original[1:])
+        os.utime(baseline, ns=(before.st_atime_ns, before.st_mtime_ns))
+        baseline.write_bytes(original)
+        os.utime(baseline, ns=(before.st_atime_ns, before.st_mtime_ns))
+        verify = run("verify-display", self.prefix, self.stage)
+        self.assertNotEqual(verify.returncode, 0)
+        self.assertNotIn("Traceback", verify.stderr)
+        result = run("apply-proposal", self.project, ".claude/settings.json", self.prefix, self.stage, self.state)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(self.target.read_bytes(), b'{"user":true}\n')
+
+    def test_natural_read_atime_change_does_not_invalidate_display_or_apply(self):
+        self.propose()
+        self.target.read_bytes()
+        self.stage.read_bytes()
+        verify = run("verify-display", self.prefix, self.stage)
+        self.assertEqual(verify.returncode, 0, verify.stderr)
+        result = run("apply-proposal", self.project, ".claude/settings.json", self.prefix, self.stage, self.state)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.target.read_bytes(), self.stage.read_bytes())
 
     def test_confirmation_path_is_allowlisted(self):
         other = self.project / "other.json"
@@ -171,6 +237,35 @@ class ConfirmationTransactionTests(unittest.TestCase):
         self.assertEqual(self.target.read_bytes(), b'{"user":true}\n')
         self.assertEqual(replaced[0].read_bytes(), external)
 
+    def test_postjournal_target_or_stage_change_is_refused_before_exchange(self):
+        module = self.module()
+        for mutate_stage in (False, True):
+            with self.subTest(mutate_stage=mutate_stage):
+                self.target.write_bytes(b'{"user":true}\n')
+                self.propose()
+                original_inode = self.target.stat().st_ino
+                real_save_state = module.save_state
+
+                def save_then_race(filename, state):
+                    real_save_state(filename, state)
+                    if mutate_stage:
+                        backup = self.target.parent / state["operations"][-1]["confirmation_backup"]
+                        backup.write_bytes(b"stage changed after journal\n")
+                    else:
+                        self.target.write_bytes(b"target changed after journal\n")
+
+                with mock.patch.object(module, "save_state", save_then_race):
+                    with self.assertRaises(module.InstallError):
+                        module.apply_proposal_command(
+                            str(self.project), ".claude/settings.json", str(self.prefix),
+                            str(self.stage), str(self.state),
+                        )
+                self.assertEqual(self.target.stat().st_ino, original_inode)
+                if mutate_stage:
+                    self.assertEqual(self.target.read_bytes(), b'{"user":true}\n')
+                else:
+                    self.assertEqual(self.target.read_bytes(), b"target changed after journal\n")
+
     def test_open_writer_fd_retained_after_success(self):
         self.propose()
         fd = os.open(self.target, os.O_WRONLY | os.O_APPEND)
@@ -216,9 +311,10 @@ class ConfirmationTransactionTests(unittest.TestCase):
             stage.write_bytes(b'confirmed\n')
             result = run('proposal', project, 'AGENTS.md', prefix)
             self.assertEqual(result.returncode, 0, result.stderr)
+            result = run('seal-display', prefix, stage)
+            self.assertEqual(result.returncode, 0, result.stderr)
             result = run('apply-proposal', project, 'AGENTS.md', prefix, stage, area / 'state.json')
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(target.stat().st_atime_ns, 1)
             self.assertEqual(target.read_bytes(), b'confirmed\n')
             backup = next(project.glob('.AGENTS.md.confirm-backup-*'))
             self.assertEqual(backup.read_bytes(), b'original\n')

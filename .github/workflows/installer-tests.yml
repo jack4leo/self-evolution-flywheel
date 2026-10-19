@@ -15,62 +15,57 @@ jobs:
           fetch-depth: 0
       - name: Validate review exclusion policy
         run: python3 scripts/freeze-review-range.py --validate-policy docs/automation/range-exclusions.json
-      - name: Run installer regression tests
+      - name: Run complete installer regression tests
         run: bash tests/test-install.sh
+      - name: Run every independent Python suite without hiding earlier failures
+        if: ${{ !cancelled() }}
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          status=0
+          for suite in tests/test-*.py tests/test_lesson_promotions.py; do
+            echo "===== $suite ====="
+            python3 "$suite" -v || status=1
+          done
+          exit "$status"
       - name: Test Lesson promotion validator
+        if: ${{ !cancelled() }}
         run: python3 tests/test_lesson_promotions.py
+
   macos-fd-xattrs:
     runs-on: macos-latest
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      FLYWHEEL_EXPECT_ATIME_CHANGE: '1'
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Diagnose snapshot timestamps against the unchanged main baseline
-        run: |
-          python3 - <<'PY'
-          import os, pathlib, subprocess, tempfile, types
-          baseline = "9d04f1b4939f53125f92b718ad8d908b744ffc80"
-          helper = ".agent-maintenance/installer-transaction.py"
-          fields = ("st_ino", "st_nlink", "st_size", "st_mode", "st_uid", "st_gid",
-                    "st_atime_ns", "st_mtime_ns", "st_ctime_ns")
-          for label, source in (
-              ("main baseline", subprocess.check_output(["git", "show", baseline + ":" + helper])),
-              ("PR head", pathlib.Path(helper).read_bytes()),
-          ):
-              module = types.ModuleType("snapshot_probe")
-              exec(compile(source, helper, "exec"), module.__dict__)
-              with tempfile.TemporaryDirectory(prefix="snapshot-probe-") as name:
-                  root = pathlib.Path(name).resolve()
-                  target = root / "AGENTS.md"
-                  target.write_bytes(b"isolated timestamp probe\n")
-                  parent = os.open(root, module.DIR_FLAGS)
-                  fd = module.open_existing(parent, target.name)
-                  try:
-                      before = os.fstat(fd)
-                      try:
-                          module.confirmation_snapshot(fd, parent)
-                          print(label, "snapshot accepted", flush=True)
-                      except (OSError, module.InstallError) as error:
-                          print(label, "snapshot refused:", error, flush=True)
-                      after = os.fstat(fd)
-                      print(label, "changed fields:", {
-                          field: [getattr(before, field), getattr(after, field)]
-                          for field in fields if getattr(before, field) != getattr(after, field)
-                      }, flush=True)
-                  finally:
-                      os.close(fd)
-                      os.close(parent)
-          PY
       - name: Test native descriptor xattrs with Python APIs absent
-        if: ${{ !cancelled() }}
         run: python3 tests/test-installer-xattrs.py -v
       - name: Test confirmed installer and retry with real xattrs
         if: ${{ !cancelled() }}
         run: python3 tests/test-installer-xattr-install.py -v
-      - name: Test confirmation and recovery identity boundaries
+      - name: Test strict snapshot version and displayed proposal binding
         if: ${{ !cancelled() }}
-        run: python3 tests/test-installer-confirmation-transaction.py -v
+        run: |
+          python3 tests/test-installer-atime-contract.py -v
+          python3 tests/test-installer-confirmation-transaction.py -v
+      - name: Test yes no EOF and no-terminal on ordinary volume
+        if: ${{ !cancelled() }}
+        run: |
+          python3 tests/test-installer-confirmation.py -v
+          python3 tests/test-installer-atime-interaction.py -v
+      - name: Test ACL flags ResourceFork metadata and same-UID writers
+        if: ${{ !cancelled() }}
+        run: python3 tests/test-macos-metadata-contract.py -v
+
+  macos-noatime:
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Verify a private APFS noatime image and run the contract suites
+        run: bash tests/run-macos-noatime.sh
 
   macos-atime-boundary-probes:
     runs-on: macos-latest
@@ -79,3 +74,18 @@ jobs:
         uses: actions/checkout@v4
       - name: Probe timestamps and candidate readers in isolated fixtures
         run: python3 tests/test-macos-atime-boundary.py -v
+
+  strict-ctime-contract:
+    # This is a real, blocking safety gate. Do not use continue-on-error or
+    # expectedFailure: an APPLIED result after the ctime-only race is unsafe
+    # under the requested contract, even when ordinary positive suites pass.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Reject a same-UID ctime-only mutation after the final check
+        run: python3 tests/test-installer-ctime-gate.py -v
