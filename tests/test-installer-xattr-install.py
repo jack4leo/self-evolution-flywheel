@@ -35,8 +35,8 @@ class XattrInstallTests(unittest.TestCase):
             agents = project / 'AGENTS.md'
             settings = project / '.claude/settings.json'
             settings.parent.mkdir()
-            agents.write_bytes(b'# Keep original instructions\n')
-            settings.write_bytes(b'{"env":{"KEEP":"yes"}}\n')
+            agents.write_bytes((ROOT / 'AGENTS.md').read_bytes().replace(b'<!-- BEGIN SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->\n', b'<!-- BEGIN SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->\n# stale framework route\n', 1) + b'\n# User-owned text\n')
+            settings.write_bytes(b'{"env":{"KEEP":"yes"},"hooks":{"SessionStart":[{"matcher":"startup","hooks":[{"type":"command","command":"bash custom-session-start.sh claude"}]}]}}\n')
             attrs = {'user.flywheel.binary': b'\x00\x01\xff', 'user.flywheel.empty': b''}
             if sys.platform == 'darwin':
                 attrs['com.apple.quarantine'] = b'0081;65f2;Safari;test-fixture'
@@ -61,13 +61,15 @@ class XattrInstallTests(unittest.TestCase):
                 'env', 'PYTHONPATH=' + str(modules), 'PYTHONDONTWRITEBYTECODE=1',
                 'bash', str(ROOT / 'install.sh'), '--target', str(project),
             ])
-            code, output, sent = PTY.terminal(command, ['y', 'y'])
-            self.assertEqual((code, sent), (0, 2), output.decode(errors='replace'))
-            self.assertTrue(agents.read_bytes().startswith(PTY.BEGIN))
+            code, output, sent = PTY.terminal(command, ['y'])
+            self.assertEqual((code, sent), (0, 1), output.decode(errors='replace'))
+            self.assertIn(PTY.BEGIN, agents.read_bytes())
+            self.assertIn(b'# User-owned text', agents.read_bytes())
             self.assertEqual(json.loads(settings.read_bytes())['env'], {'KEEP': 'yes'})
             snapshots = {path: path.read_bytes() for path in (agents, settings)}
             for path in (agents, settings):
                 backups = list(path.parent.glob('.' + path.name + '.confirm-backup-*'))
+                # Automatic AGENTS and confirmed Claude both retain displaced originals.
                 self.assertEqual(len(backups), 1)
                 for candidate in [path, *backups]:
                     fd = os.open(candidate, os.O_RDONLY)

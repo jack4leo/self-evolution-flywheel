@@ -270,7 +270,6 @@ def assert_install_complete(
         "AGENTS.md",
         "CLAUDE.md",
         "LESSONS.md",
-        "install.sh",
         ".agent-maintenance/session-start.sh",
         ".agent-maintenance/installer-transaction.py",
         ".github/PULL_REQUEST_TEMPLATE.md",
@@ -283,6 +282,8 @@ def assert_install_complete(
         )
     for relative in expected_files:
         assert (target / relative).read_bytes() == (REPO_ROOT / relative).read_bytes(), f"template file missing or differs: {relative}"
+    entry = target / ".agent-maintenance/flywheel-install.sh"
+    assert entry.is_file() and not entry.is_symlink(), "dedicated project installer entry is missing"
 
 
 def assert_fail_closed(target: pathlib.Path, env: dict[str, str], alias: pathlib.Path, phrase: str) -> None:

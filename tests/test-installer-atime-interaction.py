@@ -168,7 +168,7 @@ class InstallerAtimeInteractionTests(unittest.TestCase):
         self.project = self.area / "project"
         self.project.mkdir()
         subprocess.run(["git", "init", "-q", str(self.project)], check=True)
-        self.original = b"# Local instructions\r\nkeep every original byte\n"
+        self.original = b"{\n  \"env\": {\"KEEP\": \"yes\"},\n  \"hooks\": {\"Stop\": [{\"hooks\": [{\"type\": \"command\", \"command\": \"bash custom-session-start.sh claude\"}]}]}\n}\n"
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -187,7 +187,7 @@ class InstallerAtimeInteractionTests(unittest.TestCase):
     def seed_claude(self):
         path = self.project / ".claude/settings.json"
         path.parent.mkdir(exist_ok=True)
-        path.write_text(json.dumps({"env": {"KEEP": "yes"}, "hooks": {"Stop": []}}, indent=2) + "\n")
+        path.write_text(json.dumps({"env": {"KEEP": "yes"}, "hooks": {"SessionStart": [{"matcher": "startup", "hooks": [{"type": "command", "command": "bash custom-session-start.sh claude"}]}]}}, indent=2) + "\n")
         return path
 
     def assert_unchanged_except_atime(self, path, before, before_bytes):
@@ -209,12 +209,12 @@ class InstallerAtimeInteractionTests(unittest.TestCase):
             self.fail(f"invalid FLYWHEEL_EXPECT_ATIME_CHANGE={ATIME_EXPECTATION!r}")
 
     def test_agents_yes_installs_backup_and_retry_is_idempotent(self):
-        path = self.seed_agents()
+        path = self.seed_claude()
         before, original = fixture_baseline(path)
-        code, output, sent = run_pty(self.command(), "y")
+        code, output, sent = run_pty(self.command(False), "y")
         self.assertEqual((code, sent), (0, True), output)
         self.assertNotEqual(path.read_bytes(), original)
-        backups = list(path.parent.glob(".AGENTS.md.confirm-backup-*"))
+        backups = list(path.parent.glob(".settings.json.confirm-backup-*"))
         self.assertTrue(backups, output)
         self.assertTrue(any(backup.read_bytes() == original for backup in backups))
         first = path.read_bytes()
@@ -226,23 +226,23 @@ class InstallerAtimeInteractionTests(unittest.TestCase):
     def test_agents_no_eof_and_notty_preserve_all_non_atime_metadata(self):
         for mode in ("no", "eof", "notty"):
             with self.subTest(mode=mode):
-                path = self.seed_agents()
+                path = self.seed_claude()
                 before, original = fixture_baseline(path)
                 if mode == "notty":
-                    result = subprocess.run(self.command(), shell=True, input=b"y\n", stdout=subprocess.PIPE,
+                    result = subprocess.run(self.command(False), shell=True, input=b"y\n", stdout=subprocess.PIPE,
                                             stderr=subprocess.STDOUT, timeout=30)
                     code, output, sent = result.returncode, result.stdout, False
                 else:
-                    code, output, sent = run_pty(self.command(), "n" if mode == "no" else None,
+                    code, output, sent = run_pty(self.command(False), "n" if mode == "no" else None,
                                                  eof=mode == "eof")
                 if mode == "eof":
-                    self.assertEqual(code, 4, output)
+                    self.assertEqual(code, 0, output)
                     self.assertTrue(sent)
                 elif mode == "notty":
-                    self.assertNotEqual(code, 0, output)
+                    self.assertEqual(code, 0, output)
                     self.assertFalse(sent)
                 else:
-                    self.assertNotEqual(code, 0, output)
+                    self.assertEqual(code, 0, output)
                     self.assertTrue(sent)
                 after = metadata(path)
                 self.assert_expected_atime(before, after)
@@ -289,8 +289,21 @@ class InstallerAtimeInteractionTests(unittest.TestCase):
                 self.assert_expected_atime(before, after)
                 self.assert_unchanged_except_atime(path, before, original)
 
+    def test_marked_agents_auto_update_without_prompt(self):
+        path = self.project / "AGENTS.md"
+        begin = b"<!-- BEGIN SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->"
+        end = b"<!-- END SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->"
+        path.write_bytes(b"user prefix\n" + begin + b"\nold managed route\n" + end + b"\nuser suffix\n")
+        before, original = fixture_baseline(path)
+        code, output, sent = run_pty(self.command(), "y")
+        self.assertEqual((code, sent), (0, False), output)
+        self.assertNotEqual(path.read_bytes(), original)
+        self.assertIn(b"user prefix", path.read_bytes())
+        self.assertIn(b"user suffix", path.read_bytes())
+        self.assert_expected_atime(before, metadata(path))
+
     def test_atime_read_after_proposal_is_allowed_but_ctime_mutation_is_rejected(self):
-        path = self.seed_agents()
+        path = self.seed_claude()
         before, original = fixture_baseline(path)
 
         def read_after_prompt(_output):
@@ -304,7 +317,7 @@ class InstallerAtimeInteractionTests(unittest.TestCase):
             finally:
                 os.close(fd)
 
-        code, output, sent = run_pty(self.command(), "y", before_answer=read_after_prompt)
+        code, output, sent = run_pty(self.command(False), "y", before_answer=read_after_prompt)
         self.assertEqual((code, sent), (0, True), output)
         after = metadata(path)
         # This probe intentionally performs a normal helper read after the
@@ -333,7 +346,7 @@ class InstallerAtimeInteractionTests(unittest.TestCase):
             finally:
                 os.close(fd)
 
-        code, output, sent = run_pty(self.command(), "y", before_answer=mutate_and_restore)
+        code, output, sent = run_pty(self.command(False), "y", before_answer=mutate_and_restore)
         self.assertNotEqual(code, 0, output)
         self.assertTrue(sent)
         after, after_bytes = complete_snapshot(path)

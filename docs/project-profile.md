@@ -1,7 +1,11 @@
+<!-- BEGIN SELF-EVOLUTION-FLYWHEEL PROFILE FRAMEWORK -->
 # Project Profile (Maintained After Bootstrap)
 
 > This is an index of the target project's facts, not template defaults. The initializing agent must verify and fill it from this repository's source code, configuration, CI, and historical documentation. Keep fields without evidence as `UNKNOWN`; record fields requiring product or permission decisions as awaiting maintainer confirmation.
 
+<!-- END SELF-EVOLUTION-FLYWHEEL PROFILE FRAMEWORK -->
+
+<!-- BEGIN SELF-EVOLUTION-FLYWHEEL PROFILE FACTS -->
 ## Identity and Conventions
 
 - Project name / one-line purpose: `UNKNOWN`
@@ -43,6 +47,8 @@
 - Canonical reviewed-through SHA: the single marker at the top of [`LESSONS.md`](../LESSONS.md); do not maintain a duplicate watermark here.
 - Last review date: `UNKNOWN`
 - Lesson promotion threshold: 3 different review dates by default; see [`LESSONS.md`](../LESSONS.md). Only maintainers may explicitly adjust it.
+
+<!-- END SELF-EVOLUTION-FLYWHEEL PROFILE FACTS -->
 
 ## Update Requirements
 

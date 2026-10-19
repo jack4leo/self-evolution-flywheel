@@ -25,9 +25,10 @@ usage() {
 Usage: ./install.sh [--target DIR] [--no-hooks] [--bootstrap codex|claude]
 
 Install Self-Evolution Flywheel project guidance into an existing repository.
-Existing files are preserved unless an AGENTS.md managed-routing change or
-an additive Claude settings hook merge is explicitly confirmed after its diff
-in an interactive terminal (y/N, default N). Without a terminal they are preserved.
+Framework code follows the selected template version; unknown/custom code is
+refused with a diff. Only marked AGENTS/profile framework regions are updated.
+Project files and profile facts are preserved. Claude hooks are additive; only
+ambiguous ownership requires a reviewed terminal confirmation (default N).
 Existing Codex JSON still requires a manual merge. Exact hooks are accepted,
 missing settings files are created, and declining a settings merge skips only
 that provider; the other provider is still validated independently.
@@ -137,6 +138,15 @@ else
   exec python3 "$TRANSACTION_HELPER" lock-exec "$TARGET_DIR" "$(command -v bash)" "$INSTALLER_PATH" "${ORIGINAL_ARGS[@]}"
 fi
 
+# Pin the executing protocol before replacing any installed framework code.
+# All planning and writes use these private copies for the complete transaction.
+work_dir="$(mktemp -d)"
+trap 'rm -rf -- "$work_dir"' EXIT
+cp "$TRANSACTION_HELPER" "$work_dir/installer-transaction.py"
+cp "$SOURCE_DIR/.agent-maintenance/framework-ownership.py" "$work_dir/framework-ownership.py"
+TRANSACTION_HELPER="$work_dir/installer-transaction.py"
+OWNERSHIP_TOOL="$work_dir/framework-ownership.py"
+export FLYWHEEL_TRANSACTION_HELPER="$TRANSACTION_HELPER"
 # Recover only a provider staging hard link that can be tied to this installer's
 # exact generated settings inode, owner, contents and two-link publish boundary.
 if [[ "$INSTALL_HOOKS" == 1 ]]; then
@@ -149,25 +159,15 @@ files=(
   CLAUDE.md
   LESSONS.md
 )
-if [[ "$LOCAL_ENTRY" == 0 ]]; then
-  # A project may own install.sh as business code. The dedicated local entry
-  # must not require, enumerate, or copy that file as its own source.
-  files+=(install.sh)
-fi
+# Root install.sh belongs exclusively to the project and is never a target.
 files+=(
-  .agent-maintenance/session-start.sh
-  .agent-maintenance/installer-transaction.py
   .github/PULL_REQUEST_TEMPLATE.md
-  .github/workflows/lesson-promotion-gate.yml
 )
-template_entry="$TARGET_DIR/.agent-maintenance/flywheel-install.sh"
-while IFS= read -r -d '' source_path; do
-  files+=("${source_path#"$SOURCE_DIR"/}")
-done < <(find "$SOURCE_DIR/scripts" -type f ! -path '*/__pycache__/*' ! -name '*.pyc' -print0)
 while IFS= read -r -d '' source_path; do
   files+=("${source_path#"$SOURCE_DIR"/}")
 done < <(find "$SOURCE_DIR/docs" "$SOURCE_DIR/prompts" -type f \
-  ! -path "$SOURCE_DIR/docs/source-and-extraction.md" -print0)
+  ! -path "$SOURCE_DIR/docs/source-and-extraction.md" \
+  ! -path "$SOURCE_DIR/docs/project-profile.md" -print0)
 for relative_path in "${files[@]}"; do
   [[ -f "$SOURCE_DIR/$relative_path" ]] || {
     echo "ERROR: missing installer source file: $relative_path" >&2
@@ -223,24 +223,8 @@ for relative in relative_files:
         print(f"ERROR: existing target path is not a regular file (preserved): {relative}", file=sys.stderr)
         sys.exit(3)
 PY
-validate_destination_parents ".agent-maintenance/flywheel-install.sh" || exit 3
-template_entry_conflict=0
-if [[ -L "$template_entry" || ( -e "$template_entry" && ! -f "$template_entry" ) ]]; then
-  echo "ERROR: existing template installer entry is not a regular file: .agent-maintenance/flywheel-install.sh" >&2
-  exit 3
-elif [[ -e "$template_entry" ]]; then
-  if safe_compare_target ".agent-maintenance/flywheel-install.sh" "$INSTALLER_PATH"; then
-    :
-  else
-    compare_status=$?
-    if ((compare_status > 1)); then
-      echo "ERROR: cannot safely compare existing template installer entry; it was preserved." >&2
-      exit 3
-    fi
-    template_entry_conflict=1
-  fi
-fi
-
+# Validate all ownership boundaries before publishing any project file.
+python3 "$OWNERSHIP_TOOL" plan "$SOURCE_DIR" "$TARGET_DIR" "$LOCAL_ENTRY" "$work_dir"
 if [[ "$INSTALL_HOOKS" == 1 ]]; then
   validate_destination_parents ".codex/hooks.json" || exit 3
   validate_destination_parents ".claude/settings.json" || exit 3
@@ -259,6 +243,13 @@ import subprocess
 import sys
 
 provider, filename, target_dir, helper = sys.argv[1:]
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key!r}")
+        result[key] = value
+    return result
 sys.dont_write_bytecode = True
 protocol = runpy.run_path(helper)
 read_xattrs = protocol["xattrs"]
@@ -324,7 +315,7 @@ try:
             # Use exactly the same fd-only backend as confirmation snapshots,
             # staged metadata verification, identity checks and recovery.
             read_xattrs(handle.fileno())
-            config = json.loads(read_open_file(handle.fileno()).decode("utf-8"))
+            config = json.loads(read_open_file(handle.fileno()).decode("utf-8"), object_pairs_hook=unique_object)
             after = os.fstat(handle.fileno())
             # Only natural access-time changes are permitted. Never utime an
             # existing inode: restoring atime would manufacture a new ctime.
@@ -394,7 +385,13 @@ registered = any(
 )
 if os.path.lexists(filename) and not registered:
     if provider == "claude":
-        sys.exit(12)  # Valid additive merge: offer it only after all preflights.
+        ambiguous = any(
+            "session-start.sh" in handler.get("command", "")
+            or "flywheel" in handler.get("command", "").lower()
+            for session in sessions for handler in session.get("hooks", [])
+            if handler.get("type") == "command"
+        )
+        sys.exit(13 if ambiguous else 12)  # Never remove an unknown user hook.
     print(
         f"NOTICE: existing {filename} needs a manual hook merge; it was preserved and startup-hook registration is skipped. Template files will still be installed.",
         file=sys.stderr,
@@ -408,6 +405,7 @@ PY
 CODEX_HOOKS_ENABLED=0
 CLAUDE_HOOKS_ENABLED=0
 CLAUDE_MERGE_PROPOSAL=0
+CLAUDE_MERGE_AMBIGUOUS=0
 hook_config_conflicts=()
 codex_preflight_error=0
 claude_preflight_error=0
@@ -426,8 +424,9 @@ if [[ "$INSTALL_HOOKS" == 1 ]]; then
     CLAUDE_HOOKS_ENABLED=1
   else
     preflight_status=$?
-    if ((preflight_status == 12)); then
+    if ((preflight_status == 12 || preflight_status == 13)); then
       CLAUDE_MERGE_PROPOSAL=1
+      ((preflight_status == 13)) && CLAUDE_MERGE_AMBIGUOUS=1
     elif ((preflight_status == 11)); then
       hook_config_conflicts+=(".claude/settings.json")
     else
@@ -439,19 +438,6 @@ if [[ "$INSTALL_HOOKS" == 1 ]]; then
   fi
   if ((claude_preflight_error)); then
     exit "$claude_preflight_error"
-  fi
-fi
-
-# Never register hooks against a pre-existing project script with different
-# contents. Do this before copying files or changing either provider's settings.
-if [[ "$INSTALL_HOOKS" == 1 ]]; then
-  hook_script="$TARGET_DIR/.agent-maintenance/session-start.sh"
-  if [[ -e "$hook_script" || -L "$hook_script" ]]; then
-    if [[ ! -f "$hook_script" ]] || ! safe_compare_target ".agent-maintenance/session-start.sh" "$SOURCE_DIR/.agent-maintenance/session-start.sh"; then
-      echo "ERROR: existing .agent-maintenance/session-start.sh differs from the installer; it was preserved and no startup hooks were registered." >&2
-      echo "       Resolve the file conflict, or use --no-hooks for file-only installation." >&2
-      exit 3
-    fi
   fi
 fi
 
@@ -587,8 +573,6 @@ PY
 
 preflight_write_access
 
-work_dir="$(mktemp -d)"
-trap 'rm -rf -- "$work_dir"' EXIT
 transaction_state="$work_dir/transaction.json"
 python3 "$TRANSACTION_HELPER" init "$TARGET_DIR" "$transaction_state"
 transaction_active=1
@@ -602,6 +586,9 @@ installer_cleanup() {
   local status=$?
   trap - EXIT
   if ((status != 0 && transaction_active)); then
+    # Even a readable old journal may omit a write whose journal publication failed.
+    # Never discard private snapshots or pending-operation evidence on an error.
+    retain_work_dir=1
     echo "ERROR: installation write failed; attempting to roll back this install." >&2
     if ! rollback_transaction; then
       echo "ERROR: rollback was incomplete; uncertain files and recovery entries were preserved rather than deleted." >&2
@@ -618,15 +605,17 @@ installer_cleanup() {
 
 trap installer_cleanup EXIT
 managed_route_file="$work_dir/agents-routing.md"
-cat > "$managed_route_file" <<'ROUTE'
-<!-- BEGIN SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->
-## Self-Evolution Flywheel
-
-- Before work, read `docs/project-profile.md`, `LESSONS.md`, and `docs/code-standards.md`; read the affected subsystem page when relevant.
-- Follow repository evidence, documented validation, and permission boundaries; keep changes focused.
-- Before finishing, update affected docs/tests, run applicable checks, and report verified results and limitations.
-<!-- END SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->
-ROUTE
+# The template routing block is the authoritative version, not a second copy.
+python3 - "$SOURCE_DIR/AGENTS.md" "$managed_route_file" <<'PYROUTE'
+import sys
+from pathlib import Path
+raw = Path(sys.argv[1]).read_bytes()
+begin = b"<!-- BEGIN SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->"
+end = b"<!-- END SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->"
+if raw.count(begin) != 1 or raw.count(end) != 1 or raw.index(begin) >= raw.index(end):
+    raise SystemExit("ERROR: source AGENTS.md has invalid managed routing markers")
+Path(sys.argv[2]).write_bytes(raw[raw.index(begin):raw.index(end) + len(end)] + b"\n")
+PYROUTE
 
 display_managed_diff() {
   local status=0
@@ -735,40 +724,23 @@ import sys
 from pathlib import Path
 
 source, route_path, stage_path = map(Path, sys.argv[1:])
-begin = "<!-- BEGIN SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->"
-end = "<!-- END SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->"
-
+begin = b"<!-- BEGIN SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->"
+end = b"<!-- END SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->"
 try:
-    original = source.read_bytes()
-    text = original.decode("utf-8")
-    route = route_path.read_text(encoding="utf-8")
-except (OSError, UnicodeError) as exc:
+    text = source.read_bytes()
+    route = route_path.read_bytes().rstrip(b"\r\n")
+    lines = text.splitlines(keepends=True)
+    markers = [line.rstrip(b"\r\n") for line in lines]
+    starts = [i for i, line in enumerate(markers) if line == begin]
+    ends = [i for i, line in enumerate(markers) if line == end]
+    if text.count(begin) != 1 or text.count(end) != 1 or len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
+        raise ValueError("missing, duplicated, or out-of-order managed routing markers")
+    first, last = starts[0], ends[0]
+    newline = b"\r\n" if lines[first].endswith(b"\r\n") else b"\n"
+    ending = b"\r\n" if lines[last].endswith(b"\r\n") else (b"\n" if lines[last].endswith(b"\n") else b"")
+    stage_path.write_bytes(b"".join(lines[:first]) + route + ending + b"".join(lines[last + 1:]))
+except (OSError, ValueError) as exc:
     print(f"ERROR: cannot safely prepare managed routing for AGENTS.md: {exc}; left unchanged.", file=sys.stderr)
-    sys.exit(3)
-
-newline = "\r\n" if "\r\n" in text else "\n"
-route = route.replace("\r\n", "\n").replace("\n", newline)
-lines = text.splitlines(keepends=True)
-markers = [line.rstrip("\r\n") for line in lines]
-begin_positions = [i for i, line in enumerate(markers) if line == begin]
-end_positions = [i for i, line in enumerate(markers) if line == end]
-
-if not begin_positions and not end_positions:
-    updated = route + newline + text
-elif len(begin_positions) == 1 and len(end_positions) == 1 and begin_positions[0] < end_positions[0]:
-    first, last = begin_positions[0], end_positions[0]
-    prefix = "".join(lines[:first])
-    suffix = "".join(lines[last + 1 :])
-    updated = prefix + route + suffix
-else:
-    print("ERROR: AGENTS.md has missing, duplicated, or out-of-order managed routing markers; left unchanged.", file=sys.stderr)
-    sys.exit(3)
-
-try:
-    with stage_path.open("w", encoding="utf-8", newline="") as handle:
-        handle.write(updated)
-except OSError as exc:
-    print(f"ERROR: cannot stage managed routing for AGENTS.md: {exc}; left unchanged.", file=sys.stderr)
     sys.exit(3)
 PY
   then
@@ -790,20 +762,19 @@ PY
     return 1
   fi
 
-  if confirm_proposal "AGENTS.md"; then
-    if python3 "$TRANSACTION_HELPER" apply-proposal "$TARGET_DIR" "AGENTS.md" "$proposal" "$stage_file" "$transaction_state"; then
-      echo "UPDATED managed routing in AGENTS.md (confirmed)"
-      rm -f "$stage_file"
-      return 0
-    fi
-    echo "ERROR: AGENTS.md confirmed update was not verified; inspect the current file and reported recovery state." >&2
-    retain_work_dir=1
+  # Marker-bounded framework content has known ownership; no conflict prompt.
+  if python3 "$TRANSACTION_HELPER" apply-proposal "$TARGET_DIR" "AGENTS.md" "$proposal" "$stage_file" "$transaction_state"; then
+    echo "UPDATED framework managed routing in AGENTS.md"
     rm -f "$stage_file"
-    return 5
+    return 0
   fi
+  echo "ERROR: AGENTS.md managed update was not verified; inspect the current file and reported recovery state." >&2
+  retain_work_dir=1
   rm -f "$stage_file"
-  return 3
+  return 5
 }
+
+python3 "$OWNERSHIP_TOOL" apply "$SOURCE_DIR" "$TARGET_DIR" "$work_dir" "$transaction_state" --local-entry "$LOCAL_ENTRY"
 
 prompt_ready=0
 conflicts=()
@@ -858,25 +829,6 @@ for relative_path in "${files[@]}"; do
   echo "INSTALLED $relative_path"
   [[ "$relative_path" == "prompts/bootstrap-project.md" ]] && prompt_ready=1
 done
-
-# Keep the template installer available even when the target already owns
-# install.sh. This copy is intentionally a separate entry point.
-template_entry="$TARGET_DIR/.agent-maintenance/flywheel-install.sh"
-if [[ -e "$template_entry" || -L "$template_entry" ]]; then
-  if [[ -L "$template_entry" || ! -f "$template_entry" ]]; then
-    echo "ERROR: existing template installer entry is not a regular file: .agent-maintenance/flywheel-install.sh" >&2
-    exit 3
-  fi
-  if ((template_entry_conflict == 0)); then
-    echo "UNCHANGED .agent-maintenance/flywheel-install.sh"
-  else
-    echo "PRESERVED existing file (not overwritten): .agent-maintenance/flywheel-install.sh"
-    conflicts+=(".agent-maintenance/flywheel-install.sh")
-  fi
-else
-  python3 "$TRANSACTION_HELPER" copy "$TARGET_DIR" ".agent-maintenance/flywheel-install.sh" "$INSTALLER_PATH" "$transaction_state" >/dev/null
-  echo "INSTALLED .agent-maintenance/flywheel-install.sh"
-fi
 
 merge_hook_config() {
   local provider="$1"
@@ -980,11 +932,11 @@ PY
   echo "Proposed diff for .claude/settings.json (no changes applied yet):"
   display_managed_diff "$proposal.original" "$stage_file" ".claude/settings.json" "$proposal" || diff_status=$?
   ((diff_status <= 1)) || return 3
-  if ! confirm_proposal ".claude/settings.json"; then
+  if ((CLAUDE_MERGE_AMBIGUOUS)) && ! confirm_proposal ".claude/settings.json"; then
     return 11
   fi
   python3 "$TRANSACTION_HELPER" apply-proposal "$TARGET_DIR" ".claude/settings.json" "$proposal" "$stage_file" "$transaction_state" || return 3
-  echo "UPDATED .claude/settings.json (confirmed additive hook merge)"
+  echo "UPDATED .claude/settings.json (additive precise Flywheel hook; user hooks preserved)"
 }
 
 if [[ "$CODEX_HOOKS_ENABLED" == 1 ]]; then
@@ -1009,6 +961,8 @@ if ((CLAUDE_MERGE_PROPOSAL)); then
     fi
   fi
 fi
+
+python3 "$OWNERSHIP_TOOL" manifest "$SOURCE_DIR" "$TARGET_DIR" "$work_dir" "$transaction_state" --local-entry "$LOCAL_ENTRY"
 
 # All file and provider writes succeeded. Later notices, optional bootstrap launch,
 # or a manual-merge exit must not undo an otherwise completed install.
@@ -1117,11 +1071,6 @@ if ((${#hook_config_conflicts[@]})); then
     "${hook_config_conflicts[*]}"
 fi
 
-if ((template_entry_conflict)) && [[ -n "$BOOTSTRAP_AGENT" ]]; then
-  echo "ERROR: existing .agent-maintenance/flywheel-install.sh differs from this installer; refusing to bootstrap through an untrusted entry." >&2
-  exit 3
-fi
-
 if ((manual_merge_required)); then
   echo "ERROR: installation incomplete: the reviewed AGENTS.md block was not applied; merge it manually or rerun interactively." >&2
   exit 4
@@ -1176,8 +1125,4 @@ fi
 
 echo
 echo "Installation complete for: $TARGET_DIR"
-if ((template_entry_conflict)); then
-  echo "The existing .agent-maintenance/flywheel-install.sh differs from this installer; inspect and replace it before bootstrapping."
-else
-  echo "To initialize now: ./.agent-maintenance/flywheel-install.sh --bootstrap codex  OR  ./.agent-maintenance/flywheel-install.sh --bootstrap claude"
-fi
+echo "To initialize now: ./.agent-maintenance/flywheel-install.sh --bootstrap codex  OR  ./.agent-maintenance/flywheel-install.sh --bootstrap claude"

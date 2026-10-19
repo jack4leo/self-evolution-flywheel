@@ -1,3 +1,4 @@
+<!-- BEGIN SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->
 # Agent Work Entry Point
 
 This is a routing table, not a project encyclopedia. Keep rules and facts in their single authoritative documents, and keep this file brief when editing documentation.
@@ -24,3 +25,4 @@ This is a routing table, not a project encyclopedia. Keep rules and facts in the
 - The Agent maintains the project-specific sections of Lessons and `docs/code-standards.md`: follow the date/evidence format and promotion threshold in `LESSONS.md`, and do not turn one-off events or guesses into hard rules.
 - Product direction, explicit maintainer decisions, security exceptions, contributor bans, merge/release permissions, and other matters beyond the authorized scope must be proposed and stopped at the decision point; do not independently reverse an explicit decision.
 - A missing, invalid, or stale `.agent-maintenance/bootstrap-complete` marker is only a reminder: do not preempt the user's requested task or fill bootstrap documentation unless the user explicitly asks for bootstrap. An explicit request for template integration or project initialization authorizes bootstrap within that scope; the literal word "bootstrap" is not required. The project owner can start it with `./.agent-maintenance/flywheel-install.sh --bootstrap codex` or `./.agent-maintenance/flywheel-install.sh --bootstrap claude`; then follow [`prompts/bootstrap-project.md`](prompts/bootstrap-project.md), use only this repository's evidence, and write the marker only after completing the documentation review and verification.
+<!-- END SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->

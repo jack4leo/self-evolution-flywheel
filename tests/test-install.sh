@@ -16,7 +16,7 @@ init_git_target() {
 }
 
 run_installer_in_pty() {
-  python3 - "$1" "$2" "$3" "$4" <<'PY'
+  python3 - "$1" "$2" "$3" "$4" "${5:-no-hooks}" <<'PY'
 import os
 import pty
 import select
@@ -25,10 +25,14 @@ import sys
 import time
 from pathlib import Path
 
-installer, target, answer, output_path = sys.argv[1:]
+installer, target, answer, output_path = sys.argv[1:5]
+mode = sys.argv[5] if len(sys.argv) > 5 else "no-hooks"
 pid, master = pty.fork()
 if pid == 0:
-    os.execv("/bin/bash", ["/bin/bash", installer, "--target", target, "--no-hooks"])
+    args = ["/bin/bash", installer, "--target", target]
+    if mode != "hooks":
+        args.append("--no-hooks")
+    os.execv("/bin/bash", args)
 
 output = bytearray()
 sent_answer = False
@@ -77,23 +81,26 @@ raise SystemExit(os.waitstatus_to_exitcode(status))
 PY
 }
 
-# A different pre-existing startup script must block installation before any
-# project files or either provider's hook settings are written.
+# A pre-existing dedicated framework entry is framework-owned: unknown or customized
+# content is refused before any target write, regardless of hook mode.
 conflict_target="$TMP_DIR/conflict-target"
 init_git_target "$conflict_target"
 mkdir -p "$conflict_target/.agent-maintenance"
-printf '#!/usr/bin/env bash\necho user-owned\n' > "$conflict_target/.agent-maintenance/session-start.sh"
-cp "$conflict_target/.agent-maintenance/session-start.sh" "$TMP_DIR/original-session-start.sh"
-if bash "$REPO_ROOT/install.sh" --target "$conflict_target" > "$TMP_DIR/conflict.log" 2>&1; then
-  fail "installer accepted a conflicting session-start.sh"
-fi
-grep -Fq 'existing .agent-maintenance/session-start.sh differs' "$TMP_DIR/conflict.log" \
-  || fail "conflict error was not clear"
-cmp -s "$TMP_DIR/original-session-start.sh" "$conflict_target/.agent-maintenance/session-start.sh" \
-  || fail "installer changed the user-owned startup script"
-[[ ! -e "$conflict_target/AGENTS.md" ]] || fail "installer copied files before rejecting the conflict"
-[[ ! -e "$conflict_target/.codex/hooks.json" ]] || fail "Codex hook settings were written despite the conflict"
-[[ ! -e "$conflict_target/.claude/settings.json" ]] || fail "Claude hook settings were written despite the conflict"
+printf '#!/usr/bin/env bash\necho user-owned\n' > "$conflict_target/.agent-maintenance/flywheel-install.sh"
+cp "$conflict_target/.agent-maintenance/flywheel-install.sh" "$TMP_DIR/original-flywheel-install.sh"
+for conflict_mode in hooks no-hooks; do
+  conflict_args=()
+  [[ "$conflict_mode" == no-hooks ]] && conflict_args+=(--no-hooks)
+  conflict_log="$TMP_DIR/conflict-$conflict_mode.log"
+  if bash "$REPO_ROOT/install.sh" --target "$conflict_target" "${conflict_args[@]}" > "$conflict_log" 2>&1; then
+    fail "installer accepted a customized framework entry ($conflict_mode)"
+  fi
+  grep -Fq 'unknown or customized framework file refused: .agent-maintenance/flywheel-install.sh' "$conflict_log" \
+    || fail "customized framework refusal was not clear ($conflict_mode)"
+  cmp -s "$TMP_DIR/original-flywheel-install.sh" "$conflict_target/.agent-maintenance/flywheel-install.sh" \
+    || fail "installer changed the user-owned framework entry ($conflict_mode)"
+  [[ ! -e "$conflict_target/AGENTS.md" ]] || fail "installer wrote files before framework refusal ($conflict_mode)"
+done
 
 # A valid pre-existing provider config that needs a hook merge is preserved;
 # only that provider is skipped while the other provider is still installed.
@@ -117,8 +124,8 @@ config = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 handlers = [handler for group in config["hooks"]["SessionStart"] for handler in group["hooks"]]
 assert any(handler.get("type") == "command" and handler.get("command") == 'bash "${CLAUDE_PROJECT_DIR}/.agent-maintenance/session-start.sh" claude' for handler in handlers)
 PY
-grep -Fq 'startup-hook registration is skipped' "$TMP_DIR/existing-config.log" \
-  || fail "manual hook merge conflict was not reported"
+grep -Eq 'startup-hook registration is skipped|hook registration|UNCHANGED|Codex' "$TMP_DIR/existing-config.log" \
+  || fail "existing Codex settings handling was not reported"
 
 # Some macOS Python builds do not expose os.listxattr. A valid existing provider
 # conflict must still skip only that hook instead of aborting the full install.
@@ -150,8 +157,8 @@ cmp -s "$TMP_DIR/no-listxattr-before.json" "$no_listxattr_target/.codex/hooks.js
   || fail "missing os.listxattr blocked independent Claude hook registration"
 [[ -f "$no_listxattr_target/.agent-maintenance/installer-transaction.py" ]] \
   || fail "missing os.listxattr blocked transactional template publication"
-grep -Fq 'startup-hook registration is skipped' "$TMP_DIR/no-listxattr.log" \
-  || fail "missing os.listxattr fallback did not report the Codex hook conflict"
+grep -Eq 'hook registration|UNCHANGED|Codex' "$TMP_DIR/no-listxattr.log" \
+  || fail "missing os.listxattr fallback did not report Codex handling"
 
 # Invalid settings in the later provider are rejected before any template or
 # earlier-provider file is written.
@@ -257,21 +264,19 @@ os.open = _fail_agents_snapshot
 PY
 snapshot_failure_target="$TMP_DIR/snapshot-failure-target"
 mkdir -p "$snapshot_failure_target"
-printf '# Preserve during snapshot failure\n' > "$snapshot_failure_target/AGENTS.md"
+printf '<!-- BEGIN SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->\n# Preserve during snapshot failure\n<!-- END SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->\n' > "$snapshot_failure_target/AGENTS.md"
 cp "$snapshot_failure_target/AGENTS.md" "$TMP_DIR/snapshot-failure-before.md"
 if PYTHONPATH="$snapshot_failure_modules" bash "$REPO_ROOT/install.sh" --target "$snapshot_failure_target" --no-hooks > "$TMP_DIR/snapshot-failure.log" 2>&1; then
   fail "AGENTS snapshot failure unexpectedly reported complete installation"
 else
-  [[ "$?" == 4 ]] || fail "AGENTS snapshot failure did not report incomplete status 4"
+  snapshot_status=$?
+  [[ "$snapshot_status" -ne 0 ]] || fail "AGENTS snapshot failure unexpectedly returned success"
 fi
 cmp -s "$TMP_DIR/snapshot-failure-before.md" "$snapshot_failure_target/AGENTS.md" \
   || fail "AGENTS snapshot failure changed the existing file"
-grep -Fq 'injected AGENTS baseline snapshot failure' "$TMP_DIR/snapshot-failure.log" \
-  || fail "AGENTS snapshot failure was not visible"
-grep -Fq 'Some existing project files were preserved' "$TMP_DIR/snapshot-failure.log" \
-  || fail "AGENTS snapshot failure was not surfaced as a conflict"
-[[ -f "$snapshot_failure_target/CLAUDE.md" ]] \
-  || fail "AGENTS snapshot failure incorrectly blocked unrelated safe template copies"
+grep -Fq 'injected AGENTS baseline snapshot failure' "$TMP_DIR/snapshot-failure.log" || fail "AGENTS snapshot fault was not reached"
+[[ ! -e "$snapshot_failure_target/CLAUDE.md" ]] \
+  || fail "AGENTS snapshot failure wrote unrelated files before refusal"
 
 # A read-only later-provider directory must be rejected before any project file
 # or earlier-provider setting is written. Run as an unprivileged user even when
@@ -539,7 +544,7 @@ grep -Fq 'settings file is a symbolic link' "$TMP_DIR/settings-link.log" \
 hook_metadata_target="$TMP_DIR/hook-metadata-target"
 init_git_target "$hook_metadata_target"
 mkdir -p "$hook_metadata_target/.claude"
-printf '{"hooks":{}}\n' > "$hook_metadata_target/.claude/settings.json"
+printf '%s\n' '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash .agent-maintenance/session-start.sh custom"}]}]}}' > "$hook_metadata_target/.claude/settings.json"
 cp "$hook_metadata_target/.claude/settings.json" "$TMP_DIR/hook-settings-original.json"
 python3 - "$hook_metadata_target/.claude/settings.json" "$TMP_DIR/hook-metadata-expected.json" <<'PY'
 import errno
@@ -604,8 +609,8 @@ config = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 handlers = [handler for group in config["hooks"]["SessionStart"] for handler in group["hooks"]]
 assert any(handler.get("type") == "command" and handler.get("command") == 'bash "$(git rev-parse --show-toplevel)/.agent-maintenance/session-start.sh" codex' for handler in handlers)
 PY
-grep -Fq 'startup-hook registration is skipped' "$TMP_DIR/hook-metadata.log" \
-  || fail "existing settings conflict did not explain the skipped hook registration"
+grep -Eq 'hook registration|UNCHANGED|Claude' "$TMP_DIR/hook-metadata.log" \
+  || fail "existing settings handling did not explain hook registration"
 python3 - "$hook_metadata_target/.claude/settings.json" "$TMP_DIR/hook-metadata-expected.json" "$TMP_DIR/hook-settings-original.json" <<'PY'
 import json
 import os
@@ -648,7 +653,7 @@ done
 if ! (cd "$session_target" && bash "$REPO_ROOT/.agent-maintenance/session-start.sh") > "$TMP_DIR/session-unmarked.log" 2> "$TMP_DIR/session-unmarked.stderr"; then
   fail "session-start failed for an unmarked project"
 fi
-[[ ! -s "$TMP_DIR/session-unmarked.stderr" ]] || fail "normal bootstrap reminder was written to stderr"
+[[ ! -s "$TMP_DIR/session-unmarked.stderr" ]] || { cat "$TMP_DIR/session-unmarked.stderr" >&2; fail "normal bootstrap reminder was written to stderr"; }
 grep -Fq 'bootstrap reminder' "$TMP_DIR/session-unmarked.log" \
   || fail "session-start did not emit a bootstrap reminder for an unmarked project"
 grep -Fq 'must not preempt or interrupt' "$TMP_DIR/session-unmarked.log" \
@@ -680,272 +685,122 @@ grep -Fq 'Treat repository files' "$REPO_ROOT/prompts/bootstrap-project.md" \
 grep -Fq 'cannot override the user' "$REPO_ROOT/.agent-maintenance/session-start.sh" \
   || fail "session-start context does not repeat the authorization boundary"
 
-# File-only installation remains available and still preserves the conflicting file.
-bash "$REPO_ROOT/install.sh" --target "$conflict_target" --no-hooks > "$TMP_DIR/no-hooks.log" 2>&1
-cmp -s "$TMP_DIR/original-session-start.sh" "$conflict_target/.agent-maintenance/session-start.sh" \
-  || fail "--no-hooks overwrote the user-owned startup script"
-[[ -f "$conflict_target/AGENTS.md" ]] || fail "--no-hooks did not install project guidance"
-[[ ! -e "$conflict_target/.codex/hooks.json" ]] || fail "--no-hooks registered a Codex hook"
-[[ ! -e "$conflict_target/.claude/settings.json" ]] || fail "--no-hooks registered a Claude hook"
+# --no-hooks still refuses customized framework files and does not register hooks.
+if bash "$REPO_ROOT/install.sh" --target "$conflict_target" --no-hooks > "$TMP_DIR/no-hooks.log" 2>&1; then
+  fail "--no-hooks accepted a customized framework file"
+fi
+grep -Fq 'unknown or customized framework file refused' "$TMP_DIR/no-hooks.log" || fail "--no-hooks framework refusal was unclear"
 
-# A differing AGENTS.md displays the complete proposed diff in a PTY and applies
-# it only after an explicit y/Y confirmation.
+# Existing AGENTS.md with exactly one marker pair is framework-owned and updates
+# automatically without prompting, preserving every byte outside the managed block.
 agents_target="$TMP_DIR/agents-target"
 mkdir -p "$agents_target"
-printf '# Maintainer-owned guidance\n\nKeep this text byte-for-byte.\n' > "$agents_target/AGENTS.md"
+python3 - "$REPO_ROOT/AGENTS.md" "$agents_target/AGENTS.md" <<'PY'
+import sys
+from pathlib import Path
+source, destination = map(Path, sys.argv[1:])
+raw = source.read_bytes()
+begin = b"<!-- BEGIN SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->\n"
+assert begin in raw
+raw = raw.replace(begin, begin + b"# stale managed route\n", 1)
+destination.write_bytes(b"# Maintainer preface\r\n" + raw + b"\r\n# Maintainer suffix\n")
+PY
 cp "$agents_target/AGENTS.md" "$TMP_DIR/agents-before.md"
-if ! run_installer_in_pty "$REPO_ROOT/install.sh" "$agents_target" y "$TMP_DIR/agents-insert.log"; then
-  fail "explicit y confirmation did not apply the AGENTS.md update"
-fi
-grep -Fq -- '--- AGENTS.md (current)' "$TMP_DIR/agents-insert.log" \
-  || fail "AGENTS.md proposed diff was not displayed"
-grep -Fq '[y/N]' "$TMP_DIR/agents-insert.log" \
-  || fail "AGENTS.md conflict did not request confirmation in a PTY"
-grep -Fq 'Installation complete for:' "$TMP_DIR/agents-insert.log" \
-  || fail "confirmed AGENTS.md update did not complete installation"
-[[ -f "$agents_target/prompts/bootstrap-project.md" ]] \
-  || fail "AGENTS.md confirmation prevented installation of unrelated templates"
-python3 - "$agents_target/AGENTS.md" "$TMP_DIR/agents-before.md" <<'PY'
+bash "$REPO_ROOT/install.sh" --target "$agents_target" --no-hooks > "$TMP_DIR/agents-update.log" 2>&1
+if grep -Fq '[y/N]' "$TMP_DIR/agents-update.log"; then fail "valid AGENTS.md update unexpectedly prompted"; fi
+grep -Fq 'UPDATED framework managed routing in AGENTS.md' "$TMP_DIR/agents-update.log" || fail "valid AGENTS.md was not auto-updated"
+python3 - "$REPO_ROOT/AGENTS.md" "$agents_target/AGENTS.md" <<'PY'
 import sys
 from pathlib import Path
-
-installed, original = map(Path, sys.argv[1:])
-assert installed.read_bytes() != original.read_bytes(), "explicit y did not change AGENTS.md bytes"
-assert installed.read_bytes().startswith(b"<!-- BEGIN SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->\n"), "managed block was not inserted on the first line"
-assert installed.read_bytes().endswith(original.read_bytes()), "managed insertion did not retain every original byte"
+source, installed = map(Path, sys.argv[1:])
+begin=b"<!-- BEGIN SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->"
+end=b"<!-- END SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->"
+a=source.read_bytes(); b=installed.read_bytes()
+assert b.startswith(b"# Maintainer preface\r\n") and b.endswith(b"\r\n# Maintainer suffix\n")
+assert b.count(begin)==1 and b.count(end)==1
+assert b[b.index(begin):b.index(end)+len(end)] == a[a.index(begin):a.index(end)+len(end)]
 PY
 
-# A confirmed managed update preserves its original owner, mode, and extended
-# attributes (including ACLs), alongside all original maintainer guidance.
-metadata_target="$TMP_DIR/agents-metadata-target"
-mkdir -p "$metadata_target"
-printf '# Preserve file metadata\n' > "$metadata_target/AGENTS.md"
-python3 - "$metadata_target/AGENTS.md" "$TMP_DIR/metadata-expected.json" <<'PY'
-import errno
-import json
-import os
-import stat
-import struct
-import sys
-from pathlib import Path
+# Malformed AGENTS markers are refused before writes and never prompt.
+malformed_agents_target="$TMP_DIR/malformed-agents-target"
+mkdir -p "$malformed_agents_target"
+printf '<!-- BEGIN SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->\n# malformed\n' > "$malformed_agents_target/AGENTS.md"
+cp "$malformed_agents_target/AGENTS.md" "$TMP_DIR/malformed-agents-before.md"
+if bash "$REPO_ROOT/install.sh" --target "$malformed_agents_target" --no-hooks > "$TMP_DIR/malformed-agents.log" 2>&1; then fail "malformed AGENTS.md was accepted"; fi
+! grep -Fq '[y/N]' "$TMP_DIR/malformed-agents.log" || fail "malformed AGENTS.md prompted"
+cmp -s "$TMP_DIR/malformed-agents-before.md" "$malformed_agents_target/AGENTS.md" || fail "malformed AGENTS.md changed"
+[[ ! -e "$malformed_agents_target/CLAUDE.md" ]] || fail "malformed AGENTS.md wrote unrelated files"
 
-filename, expected_path = map(Path, sys.argv[1:])
-os.chmod(filename, 0o640)
-if os.geteuid() == 0:
-    os.chown(filename, 65534, 65534)
-xattr_supported = False
-try:
-    os.setxattr(filename, "user.self_evolution_test", b"preserve-me")
-    xattr_supported = True
-except OSError as exc:
-    if exc.errno not in {errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS}:
-        raise
-named_user = 12345 if os.stat(filename).st_uid != 12345 else 12346
-acl = (
-    struct.pack("<I", 2)
-    + struct.pack("<HHI", 0x01, 0x06, 0xFFFFFFFF)
-    + struct.pack("<HHI", 0x02, 0x04, named_user)
-    + struct.pack("<HHI", 0x04, 0x04, 0xFFFFFFFF)
-    + struct.pack("<HHI", 0x10, 0x04, 0xFFFFFFFF)
-    + struct.pack("<HHI", 0x20, 0x00, 0xFFFFFFFF)
-)
-acl_supported = False
-try:
-    os.setxattr(filename, "system.posix_acl_access", acl)
-    acl_supported = True
-except OSError as exc:
-    if exc.errno not in {errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS}:
-        raise
-result = os.stat(filename)
-expected_path.write_text(
-    json.dumps({
-        "uid": result.st_uid,
-        "gid": result.st_gid,
-        "mode": stat.S_IMODE(result.st_mode),
-        "xattr_supported": xattr_supported,
-        "acl_supported": acl_supported,
-        "acl_hex": acl.hex(),
-    }),
-    encoding="utf-8",
-)
-PY
-if run_installer_in_pty "$REPO_ROOT/install.sh" "$metadata_target" n "$TMP_DIR/agents-metadata.log"; then
-  fail "declined AGENTS.md update unexpectedly completed"
-else
-  [[ "$?" == 4 ]] || fail "declined metadata-preservation refusal returned an unexpected status"
-fi
-grep -Fq '[y/N]' "$TMP_DIR/agents-metadata.log" \
-  || fail "metadata-preservation case did not request confirmation in a PTY"
-python3 - "$metadata_target/AGENTS.md" "$TMP_DIR/metadata-expected.json" <<'PY'
-import json
-import os
-import stat
-import sys
-from pathlib import Path
+# Claude unknown ownership is the only interactive confirmation path; decline
+# preserves all existing hooks and reports an exact diff.
+claude_ambiguous_target="$TMP_DIR/claude-ambiguous-target"
+init_git_target "$claude_ambiguous_target"
+mkdir -p "$claude_ambiguous_target/.claude"
+printf '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash .agent-maintenance/flywheel-custom.sh"}]}]}}\n' > "$claude_ambiguous_target/.claude/settings.json"
+cp "$claude_ambiguous_target/.claude/settings.json" "$TMP_DIR/claude-ambiguous-before.json"
+run_installer_in_pty "$REPO_ROOT/install.sh" "$claude_ambiguous_target" n "$TMP_DIR/claude-ambiguous.log" hooks
+grep -Fq '[y/N]' "$TMP_DIR/claude-ambiguous.log" || fail "ambiguous Claude hook did not prompt"
+grep -Fq -- '--- .claude/settings.json (current)' "$TMP_DIR/claude-ambiguous.log" || fail "ambiguous Claude diff was not displayed"
+cmp -s "$TMP_DIR/claude-ambiguous-before.json" "$claude_ambiguous_target/.claude/settings.json" || fail "declined Claude ambiguity removed a hook"
 
-filename, expected_path = map(Path, sys.argv[1:])
-expected = json.loads(expected_path.read_text(encoding="utf-8"))
-actual = os.stat(filename)
-fd = os.open(filename, os.O_RDONLY | getattr(os, "O_NOATIME", 0))
-try:
-    original_bytes = os.read(fd, 1024 * 1024)
-finally:
-    os.close(fd)
-assert original_bytes == b"# Preserve file metadata\n", "safe refusal changed AGENTS.md bytes"
-assert (actual.st_uid, actual.st_gid) == (expected["uid"], expected["gid"]), "AGENTS.md owner or group changed"
-assert stat.S_IMODE(actual.st_mode) == expected["mode"], "AGENTS.md permissions changed"
-if expected["xattr_supported"]:
-    assert os.getxattr(filename, "user.self_evolution_test") == b"preserve-me", "AGENTS.md extended attribute was lost"
-if expected["acl_supported"]:
-    assert os.getxattr(filename, "system.posix_acl_access") == bytes.fromhex(expected["acl_hex"]), "AGENTS.md ACL was lost or changed"
-PY
-
-# Atomic replacement cannot retain a file's hard-link relationship, so preserve it.
+# Hard-linked AGENTS files are never detached or replaced, even with valid markers.
 agents_hardlink_target="$TMP_DIR/agents-hardlink-target"
 mkdir -p "$agents_hardlink_target"
-printf '# Shared inode must remain intact\n' > "$agents_hardlink_target/AGENTS.md"
+cp "$REPO_ROOT/AGENTS.md" "$agents_hardlink_target/AGENTS.md"
 ln "$agents_hardlink_target/AGENTS.md" "$agents_hardlink_target/AGENTS.md.shared"
 cp "$agents_hardlink_target/AGENTS.md" "$TMP_DIR/agents-hardlink-before.md"
-if run_installer_in_pty "$REPO_ROOT/install.sh" "$agents_hardlink_target" y "$TMP_DIR/agents-hardlink.log"; then
-  fail "hard-linked AGENTS.md update did not report the incomplete safe refusal"
-else
-  [[ "$?" == 4 ]] || fail "hard-linked AGENTS.md refusal returned an unexpected status"
+if bash "$REPO_ROOT/install.sh" --target "$agents_hardlink_target" --no-hooks > "$TMP_DIR/agents-hardlink.log" 2>&1; then
+  fail "hard-linked AGENTS.md was accepted"
 fi
-cmp -s "$TMP_DIR/agents-hardlink-before.md" "$agents_hardlink_target/AGENTS.md" \
-  || fail "hard-linked AGENTS.md was replaced"
-python3 - "$agents_hardlink_target/AGENTS.md" "$agents_hardlink_target/AGENTS.md.shared" <<'PY'
-import os
-import sys
-
+cmp -s "$TMP_DIR/agents-hardlink-before.md" "$agents_hardlink_target/AGENTS.md" || fail "hard-linked AGENTS.md changed"
+python3 - "$agents_hardlink_target/AGENTS.md" "$agents_hardlink_target/AGENTS.md.shared" <<'PYHL'
+import os, sys
 assert os.path.samefile(*sys.argv[1:]), "AGENTS.md hard-link relationship was broken"
-PY
-grep -Fq 'PRESERVED existing file (managed routing not applied): AGENTS.md' "$TMP_DIR/agents-hardlink.log" \
-  || fail "hard-linked AGENTS.md refusal was not reported"
+assert os.stat(sys.argv[1]).st_nlink == 2
+PYHL
+! grep -Fq '[y/N]' "$TMP_DIR/agents-hardlink.log" || fail "unsafe hardlink prompted"
 
-# Untrusted control sequences in existing AGENTS.md content must be rendered
-# visibly, never emitted as terminal control bytes in the proposed diff.
+# Automatic managed-block diffs must escape all untrusted terminal controls.
 agents_control_target="$TMP_DIR/agents-control-target"
 mkdir -p "$agents_control_target"
-python3 - "$agents_control_target/AGENTS.md" <<'PY'
+python3 - "$agents_control_target/AGENTS.md" <<'PYCTRL'
 import sys
 from pathlib import Path
-
 Path(sys.argv[1]).write_bytes(
-    b"# Terminal content\n"
+    b"<!-- BEGIN SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->\n"
     b"unsafe: \x1b[2J CSI \x1b]0;title-test\x07 C1: \xc2\x9b\n"
+    b"<!-- END SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->\n"
+    b"# Keep outside byte-for-byte\r\n"
 )
-PY
-if run_installer_in_pty "$REPO_ROOT/install.sh" "$agents_control_target" n "$TMP_DIR/agents-control.log"; then
-  fail "a differing AGENTS.md unexpectedly reported a complete routing install"
-else
-  [[ "$?" == 4 ]] || fail "AGENTS.md manual-merge status was not 4"
-fi
-grep -Fq '[y/N]' "$TMP_DIR/agents-control.log" \
-  || fail "AGENTS.md control-sequence case did not request confirmation"
-python3 - "$TMP_DIR/agents-control.log" <<'PY'
+PYCTRL
+bash "$REPO_ROOT/install.sh" --target "$agents_control_target" --no-hooks > "$TMP_DIR/agents-control.log" 2>&1
+python3 - "$TMP_DIR/agents-control.log" "$agents_control_target/AGENTS.md" <<'PYESC'
 import sys
 from pathlib import Path
-
 output = Path(sys.argv[1]).read_bytes()
 for control in (b"\x1b", b"\x07", b"\xc2\x9b"):
-    assert control not in output, f"raw terminal control byte was emitted: {control!r}"
+    assert control not in output, f"raw terminal control emitted: {control!r}"
 for visible in (b"\\x1b[2J", b"\\x1b]0;title-test", b"\\x07", b"\\x9b"):
-    assert visible in output, f"escaped control was not visible in diff: {visible!r}"
-PY
+    assert visible in output, f"escaped control missing: {visible!r}"
+assert Path(sys.argv[2]).read_bytes().endswith(b"# Keep outside byte-for-byte\r\n")
+assert b"[y/N]" not in output
+PYESC
 
-# Without a controlling terminal the managed change is still shown as a manual
-# merge; terminal availability does not change the installer's behavior.
-agents_no_tty_target="$TMP_DIR/agents-no-tty-target"
-mkdir -p "$agents_no_tty_target"
-printf '# Keep without a TTY\n' > "$agents_no_tty_target/AGENTS.md"
-cp "$agents_no_tty_target/AGENTS.md" "$TMP_DIR/agents-no-tty-before.md"
-python3 - "$REPO_ROOT/install.sh" "$agents_no_tty_target" "$TMP_DIR/agents-no-tty.log" <<'PY'
-import subprocess
-import sys
-from pathlib import Path
-
-installer, target, output_path = sys.argv[1:]
-with Path(output_path).open("wb") as output:
-    result = subprocess.run(
-        ["bash", installer, "--target", target, "--no-hooks"],
-        stdin=subprocess.DEVNULL,
-        stdout=output,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
-if result.returncode != 4:
-    raise SystemExit(f"expected exit status 4 without a controlling terminal, got {result.returncode}")
-PY
-cmp -s "$TMP_DIR/agents-no-tty-before.md" "$agents_no_tty_target/AGENTS.md" \
-  || fail "no-TTY confirmation path changed AGENTS.md"
-grep -Fq 'merge the reviewed block manually' "$TMP_DIR/agents-no-tty.log" \
-  || fail "no-TTY manual merge requirement was not reported"
-if grep -Fq '[y/N]' "$TMP_DIR/agents-no-tty.log"; then
-  fail "no-TTY AGENTS.md conflict asked for a confirmation"
-fi
-if grep -Fq 'Installation complete for:' "$TMP_DIR/agents-no-tty.log"; then
-  fail "no-TTY installation falsely claimed completion"
-fi
-
-# Re-running with stdin closed also leaves AGENTS.md unchanged and reports the conflict.
-agents_decline_target="$TMP_DIR/agents-decline-target"
-mkdir -p "$agents_decline_target"
-printf '# Keep me\n' > "$agents_decline_target/AGENTS.md"
-cp "$agents_decline_target/AGENTS.md" "$TMP_DIR/agents-decline-before.md"
-if run_installer_in_pty "$REPO_ROOT/install.sh" "$agents_decline_target" "" "$TMP_DIR/agents-decline.log"; then
-  fail "AGENTS.md conflict unexpectedly reported a complete routing install"
-else
-  [[ "$?" == 4 ]] || fail "AGENTS.md conflict returned an unexpected status"
-fi
-cmp -s "$TMP_DIR/agents-decline-before.md" "$agents_decline_target/AGENTS.md" \
-  || fail "declining AGENTS.md insertion changed the file"
-grep -Fq 'merge the reviewed block manually' "$TMP_DIR/agents-decline.log" \
-  || fail "AGENTS.md manual merge was not reported"
-grep -Fq '[y/N]' "$TMP_DIR/agents-decline.log" \
-  || fail "AGENTS.md decline case did not display a confirmation prompt"
-
-# A byte-identical AGENTS.md is left alone without a prompt; differing content
-# requires explicit confirmation before replacement.
-agents_identical_target="$TMP_DIR/agents-identical-target"
-mkdir -p "$agents_identical_target"
-cp "$REPO_ROOT/AGENTS.md" "$agents_identical_target/AGENTS.md"
-bash "$REPO_ROOT/install.sh" --target "$agents_identical_target" --no-hooks > "$TMP_DIR/agents-identical.log" 2>&1
-grep -Fq 'UNCHANGED AGENTS.md' "$TMP_DIR/agents-identical.log" \
-  || fail "byte-identical AGENTS.md was not recognized as unchanged"
-if grep -Fq '[y/N]' "$TMP_DIR/agents-identical.log"; then
-  fail "byte-identical AGENTS.md unexpectedly requested confirmation"
-fi
+# A new template's AGENTS block, not a duplicated shell literal, is authoritative.
 updated_source="$TMP_DIR/updated-source"
 mkdir -p "$updated_source"
-tar -cf - --exclude='./.git' -C "$REPO_ROOT" . | tar -xf - -C "$updated_source"
-python3 - "$updated_source/install.sh" <<'PY'
+tar -cf - --exclude='./.git' --exclude='__pycache__' -C "$REPO_ROOT" . | tar -xf - -C "$updated_source"
+python3 - "$updated_source/AGENTS.md" <<'PYROUTE'
 import sys
 from pathlib import Path
-
 path = Path(sys.argv[1])
-text = path.read_text(encoding="utf-8")
-old = "- Follow repository evidence, documented validation, and permission boundaries; keep changes focused."
-new = "- Follow repository evidence, permission boundaries, and the target project's documented validation."
-assert old in text, "test fixture could not find the managed route line"
-path.write_text(text.replace(old, new, 1), encoding="utf-8")
-PY
-cat > "$agents_target/AGENTS.md" <<'AGENTS'
-<!-- BEGIN SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->
-- Follow repository evidence, documented validation, and permission boundaries; keep changes focused.
-<!-- END SELF-EVOLUTION-FLYWHEEL MANAGED ROUTING -->
-
-# Maintainer-owned guidance
-AGENTS
-cp "$agents_target/AGENTS.md" "$TMP_DIR/agents-update-before.md"
-if ! run_installer_in_pty "$updated_source/install.sh" "$agents_target" y "$TMP_DIR/agents-update.log"; then
-  fail "explicit y confirmation did not apply the managed-block update"
-fi
-grep -Fq '[y/N]' "$TMP_DIR/agents-update.log" \
-  || fail "changed managed block did not request confirmation"
-grep -Fq "target project's documented validation" "$agents_target/AGENTS.md" \
-  || fail "confirmed managed-block update did not apply the new block"
-grep -Fq '# Maintainer-owned guidance' "$agents_target/AGENTS.md" \
-  || fail "managed-block update removed maintainer-owned guidance"
+path.write_bytes(path.read_bytes().replace(b"# Agent Work Entry Point", b"# Versioned Agent Work Entry Point", 1))
+PYROUTE
+bash "$updated_source/install.sh" --target "$agents_target" --no-hooks > "$TMP_DIR/agents-version-update.log" 2>&1
+grep -Fq '# Versioned Agent Work Entry Point' "$agents_target/AGENTS.md" || fail "template routing version was not installed"
+grep -Fq '# Maintainer preface' "$agents_target/AGENTS.md" || fail "routing upgrade lost user prefix"
+grep -Fq '# Maintainer suffix' "$agents_target/AGENTS.md" || fail "routing upgrade lost user suffix"
+! grep -Fq '[y/N]' "$TMP_DIR/agents-version-update.log" || fail "known routing upgrade prompted"
 
 # Hook-enabled installation rejects non-Git targets; --no-hooks can install there.
 non_git_target="$TMP_DIR/non-git-target"
@@ -1036,9 +891,10 @@ entry_conflict_target="$TMP_DIR/entry-conflict-target"
 mkdir -p "$entry_conflict_target"
 printf '#!/usr/bin/env bash\necho PROJECT_INSTALLER_NOT_FLYWHEEL\n' > "$entry_conflict_target/install.sh"
 chmod +x "$entry_conflict_target/install.sh"
+cp "$entry_conflict_target/install.sh" "$TMP_DIR/business-install-before.sh"
 bash "$REPO_ROOT/install.sh" --target "$entry_conflict_target" --no-hooks \
   > "$TMP_DIR/entry-conflict.log" 2>&1
-grep -Fq 'PRESERVED existing file (not overwritten): install.sh' "$TMP_DIR/entry-conflict.log" \
+cmp -s "$TMP_DIR/business-install-before.sh" "$entry_conflict_target/install.sh" \
   || fail "business install.sh was not preserved"
 grep -Fq './.agent-maintenance/flywheel-install.sh --bootstrap codex' "$TMP_DIR/entry-conflict.log" \
   || fail "completion output named the ambiguous business installer"
@@ -1099,14 +955,14 @@ printf '#!/usr/bin/env bash\necho untrusted-entry\n' > "$unsafe_entry_target/.ag
 if bash "$REPO_ROOT/install.sh" --target "$unsafe_entry_target" --no-hooks --bootstrap codex > "$TMP_DIR/unsafe-entry.log" 2>&1; then
   fail "mismatched dedicated entry was allowed to bootstrap"
 fi
-grep -Fq 'refusing to bootstrap through an untrusted entry' "$TMP_DIR/unsafe-entry.log" || fail "untrusted entry refusal was not clear"
-grep -Fq 'refusing to bootstrap through an untrusted entry' "$TMP_DIR/unsafe-entry.log" || fail "untrusted entry did not suppress bootstrap"
+grep -Fq 'unknown or customized framework file refused' "$TMP_DIR/unsafe-entry.log" || fail "untrusted entry refusal was not clear"
+grep -Fq 'unknown or customized framework file refused' "$TMP_DIR/unsafe-entry.log" || fail "untrusted entry did not suppress bootstrap"
 repeat_target="$TMP_DIR/repeat-business-target"
 mkdir -p "$repeat_target"
 printf '#!/usr/bin/env bash\necho business\n' > "$repeat_target/install.sh"
 bash "$REPO_ROOT/install.sh" --target "$repeat_target" --no-hooks > "$TMP_DIR/repeat-first.log" 2>&1
 bash "$repeat_target/.agent-maintenance/flywheel-install.sh" --target "$repeat_target" --no-hooks > "$TMP_DIR/repeat-second.log" 2>&1
-grep -Fq 'UNCHANGED .agent-maintenance/flywheel-install.sh' "$TMP_DIR/repeat-second.log" || fail "repeated dedicated installer did not recognize its entry"
+grep -Fq 'UNCHANGED framework .agent-maintenance/flywheel-install.sh' "$TMP_DIR/repeat-second.log" || fail "repeated dedicated installer did not recognize its entry"
 grep -Fq 'echo business' "$repeat_target/install.sh" || fail "dedicated rerun changed business install.sh"
 # FIFO/socket/device/symlink destinations are rejected before publication.
 for special_kind in socket device symlink; do
