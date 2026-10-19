@@ -166,14 +166,178 @@ def rename_noreplace(parent_fd, source, destination):
         raise OSError(error, os.strerror(error), destination)
 
 
-def xattrs(fd):
-    listxattr = getattr(os, "listxattr", None)
-    getxattr = getattr(os, "getxattr", None)
-    if not callable(listxattr) or not callable(getxattr):
+_DARWIN_XATTR_SHOWCOMPRESSION = 0x20
+
+
+def _darwin_xattr_functions():
+    if sys.platform != "darwin":
         return None
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        functions = {
+            "list": libc.flistxattr,
+            "get": libc.fgetxattr,
+            "set": libc.fsetxattr,
+            "remove": libc.fremovexattr,
+        }
+    except AttributeError:
+        return None
+    functions["list"].argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    functions["list"].restype = ctypes.c_ssize_t
+    functions["get"].argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int]
+    functions["get"].restype = ctypes.c_ssize_t
+    functions["set"].argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int]
+    functions["set"].restype = ctypes.c_int
+    functions["remove"].argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+    functions["remove"].restype = ctypes.c_int
+    return functions
+
+
+def _xattr_api():
+    # Darwin's default os API cannot request SHOWCOMPRESSION. Always use the
+    # fd ABI there so the visible attribute set does not depend on Python's
+    # build, and hidden compression metadata is never silently discarded.
+    if sys.platform == "darwin":
+        fallback = _darwin_xattr_functions()
+        if fallback is None:
+            raise OSError(errno.ENOTSUP, "native descriptor xattr APIs are unavailable")
+        return ("darwin", fallback)
+    native = {
+        "list": getattr(os, "listxattr", None),
+        "get": getattr(os, "getxattr", None),
+        "set": getattr(os, "setxattr", None),
+        "remove": getattr(os, "removexattr", None),
+    }
+    if all(callable(function) for function in native.values()):
+        return ("native", native)
+    return None
+
+
+def _xattr_name_bytes(name):
+    if not isinstance(name, str) or not name or "\x00" in name:
+        raise OSError(errno.EINVAL, "invalid extended attribute name")
+    return os.fsencode(name)
+
+
+def _darwin_list(function, fd):
+    size = function(fd, None, 0, _DARWIN_XATTR_SHOWCOMPRESSION)
+    if size < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    buffer = ctypes.create_string_buffer(size) if size else None
+    result = function(fd, buffer, size, _DARWIN_XATTR_SHOWCOMPRESSION)
+    if result < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    if result != size:
+        raise OSError(errno.ERANGE, "extended attribute name list changed during inspection")
+    if size == 0:
+        return []
+    raw = buffer.raw[:result]
+    if not raw or raw[-1] != 0:
+        raise OSError(errno.EIO, "malformed extended attribute name list")
+    names = raw[:-1].split(b"\x00")
+    if any(not name for name in names) or len(set(names)) != len(names):
+        raise OSError(errno.EIO, "malformed extended attribute name list")
+    try:
+        return [name.decode("utf-8") for name in names]
+    except UnicodeDecodeError as exc:
+        raise OSError(errno.EILSEQ, "invalid extended attribute name encoding") from exc
+
+
+def _darwin_get(function, fd, name):
+    encoded = _xattr_name_bytes(name)
+    size = function(fd, encoded, None, 0, 0, _DARWIN_XATTR_SHOWCOMPRESSION)
+    if size < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), name)
+    buffer = ctypes.create_string_buffer(size) if size else None
+    result = function(fd, encoded, buffer, size, 0, _DARWIN_XATTR_SHOWCOMPRESSION)
+    if result < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), name)
+    if result != size:
+        raise OSError(errno.ERANGE, "extended attribute changed during inspection", name)
+    return b"" if result == 0 else buffer.raw[:result]
+
+
+def xattr_list(fd):
+    api = _xattr_api()
+    if api is None:
+        raise NotImplementedError("xattr APIs are unavailable")
+    kind, functions = api
+    if kind == "native":
+        names = list(functions["list"](fd))
+        if (any(not isinstance(name, str) or not name or "\x00" in name for name in names)
+                or len(set(names)) != len(names)):
+            raise OSError(errno.EIO, "malformed extended attribute name list")
+        return names
+    return _darwin_list(functions["list"], fd)
+
+
+def xattr_get(fd, name):
+    api = _xattr_api()
+    if api is None:
+        raise NotImplementedError("xattr APIs are unavailable")
+    kind, functions = api
+    if kind == "native":
+        return functions["get"](fd, name)
+    return _darwin_get(functions["get"], fd, name)
+
+
+def xattr_set(fd, name, value):
+    api = _xattr_api()
+    if api is None:
+        raise NotImplementedError("xattr APIs are unavailable")
+    if not isinstance(value, bytes):
+        raise TypeError("extended attribute value must be bytes")
+    kind, functions = api
+    if kind == "native":
+        return functions["set"](fd, name, value)
+    encoded = _xattr_name_bytes(name)
+    buffer = ctypes.create_string_buffer(value) if value else None
+    result = functions["set"](fd, encoded, buffer, len(value), 0, 0)
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), name)
+
+
+def xattr_remove(fd, name):
+    api = _xattr_api()
+    if api is None:
+        raise NotImplementedError("xattr APIs are unavailable")
+    kind, functions = api
+    if kind == "native":
+        return functions["remove"](fd, name)
+    result = functions["remove"](fd, _xattr_name_bytes(name), 0)
+    if result != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), name)
+
+
+def xattrs(fd):
+    if _xattr_api() is None:
+        return None
+    before = os.fstat(fd)
+    names = xattr_list(fd)
+    if sys.platform == "darwin" and "com.apple.decmpfs" in names:
+        # These bytes describe the *old compressed contents*. Copying them onto
+        # a new expanded payload is not a safe metadata-preserving update.
+        raise InstallError("cannot safely rewrite compression metadata; original file preserved")
     values = {}
-    for name in listxattr(fd):
-        values[name] = base64.b64encode(getxattr(fd, name)).decode("ascii")
+    for name in names:
+        values[name] = base64.b64encode(xattr_get(fd, name)).decode("ascii")
+    final_names = xattr_list(fd)
+    verified = {
+        name: base64.b64encode(xattr_get(fd, name)).decode("ascii")
+        for name in final_names
+    }
+    after = os.fstat(fd)
+    stable = ("st_dev", "st_ino", "st_size", "st_mode", "st_uid", "st_gid",
+              "st_nlink", "st_mtime_ns", "st_ctime_ns")
+    if (values != verified
+            or any(getattr(before, field) != getattr(after, field) for field in stable)):
+        raise InstallError("file or extended attributes changed during inspection")
     return values
 
 
@@ -189,13 +353,17 @@ def identity(fd):
             break
         digest.update(chunk)
     after = os.fstat(fd)
-    stable = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_mode", "st_uid", "st_gid")
+    stable = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_mode", "st_uid", "st_gid",
+              "st_nlink", "st_ctime_ns")
     if any(getattr(before, name) != getattr(after, name) for name in stable):
         raise InstallError("file changed while it was being inspected")
     if after.st_atime_ns != before.st_atime_ns:
         os.utime(fd, ns=(before.st_atime_ns, before.st_mtime_ns))
         after = os.fstat(fd)
     attributes = xattrs(fd)
+    final = os.fstat(fd)
+    if any(getattr(after, name) != getattr(final, name) for name in stable):
+        raise InstallError("file changed while its extended attributes were inspected")
     return {
         "device": after.st_dev,
         "inode": after.st_ino,
@@ -281,17 +449,12 @@ def apply_metadata(fd, values):
             name: base64.b64decode(value)
             for name, value in values.get("xattrs", {}).items()
         }
-        listxattr = getattr(os, "listxattr", None)
-        getxattr = getattr(os, "getxattr", None)
-        removexattr = getattr(os, "removexattr", None)
-        setxattr = getattr(os, "setxattr", None)
-        xattr_api = all(callable(function) for function in (listxattr, getxattr, removexattr, setxattr))
-        if xattr_api:
-            for name in listxattr(fd):
+        if _xattr_api() is not None:
+            for name in xattr_list(fd):
                 if name not in wanted:
-                    removexattr(fd, name)
+                    xattr_remove(fd, name)
             for name, value in wanted.items():
-                setxattr(fd, name, value)
+                xattr_set(fd, name, value)
             actual = xattrs(fd)
         elif wanted:
             raise NotImplementedError("xattr APIs are unavailable for requested file attributes")
@@ -909,6 +1072,9 @@ def confirmation_snapshot(fd, parent_fd):
     if any(getattr(before, field) != getattr(after, field) for field in fields):
         raise InstallError("file changed while the confirmation snapshot was read")
     attrs = xattrs(fd)
+    final = os.fstat(fd)
+    if any(getattr(after, field) != getattr(final, field) for field in fields):
+        raise InstallError("file changed while the confirmation attributes were read")
     return {
         "inode": {"device": after.st_dev, "number": after.st_ino, "nlink": after.st_nlink},
         "content": {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data)},

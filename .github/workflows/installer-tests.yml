@@ -19,3 +19,14 @@ jobs:
         run: bash tests/test-install.sh
       - name: Test Lesson promotion validator
         run: python3 tests/test_lesson_promotions.py
+  macos-fd-xattrs:
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Test native descriptor xattrs with Python APIs absent
+        run: python3 tests/test-installer-xattrs.py -v
+      - name: Test confirmed installer and retry with real xattrs
+        run: python3 tests/test-installer-xattr-install.py -v
+      - name: Test confirmation and recovery identity boundaries
+        run: python3 tests/test-installer-confirmation-transaction.py -v

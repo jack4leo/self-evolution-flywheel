@@ -1176,5 +1176,6 @@ PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/tests/test-range-writer.py"
 PYTHONDONTWRITEBYTECODE=1 python3 "$REPO_ROOT/tests/test-daily-review-temp.py"
 python3 "$REPO_ROOT/tests/test-installer-confirmation.py"
 python3 "$REPO_ROOT/tests/test-installer-confirmation-transaction.py"
-
+python3 "$REPO_ROOT/tests/test-installer-xattrs.py"
+python3 "$REPO_ROOT/tests/test-installer-xattr-install.py"
 echo "PASS: installer safety, hook, session-start, read-only range-freezer, and frozen-range writer regression tests"
