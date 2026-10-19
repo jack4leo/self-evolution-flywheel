@@ -172,7 +172,7 @@ class InstallerSecurityRegressionTests(unittest.TestCase):
             self.assertNotIn("read and execute prompts/bootstrap-project.md", result.stdout)
             self.assertNotIn("untrusted external instructions", result.stdout)
 
-    def test_help_and_docs_match_manual_merge_and_error_stream_behavior(self) -> None:
+    def test_help_and_docs_match_confirmed_merge_and_error_stream_behavior(self) -> None:
         help_result = subprocess.run(
             ["bash", str(INSTALLER), "--help"],
             stdout=subprocess.PIPE,
@@ -183,11 +183,15 @@ class InstallerSecurityRegressionTests(unittest.TestCase):
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         docs = (REPO_ROOT / "docs/installation.md").read_text(encoding="utf-8")
         help_text = " ".join(help_result.stdout.split())
-        self.assertIn("must be merged manually", help_text)
-        self.assertIn("only that provider's hook registration is skipped", help_text)
-        self.assertIn("never automatically replaced", readme)
-        self.assertIn("merge the reviewed block manually", readme)
-        self.assertIn("hook registration is skipped", readme)
+        self.assertIn("explicitly confirmed after its diff", help_text)
+        self.assertIn("y/N, default N", help_text)
+        self.assertIn("declining a settings merge skips only that provider", help_text)
+        self.assertIn("Existing Codex JSON still requires a manual merge", help_text)
+        self.assertIn("only `y` or `Y` authorizes that change", readme)
+        self.assertIn("Declining, EOF, or no interactive terminal preserves the original", readme)
+        self.assertIn("skipping one provider does not block the other", readme)
+        self.assertIn("never script stdin", docs)
+        self.assertIn("no silent overwrite", docs)
         self.assertIn("writes its diagnostic to stderr", docs)
         self.assertNotIn("diagnostic to stdout", docs)
 
