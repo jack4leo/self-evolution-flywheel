@@ -121,6 +121,8 @@ class AtimeBoundaryTests(unittest.TestCase):
         after = fields(self.fd)
         evidence(label, before, after, content_sha256=hashlib.sha256(got).hexdigest())
         self.assertEqual(got, b"original payload\n" * 64)
+        self.assertNotEqual(before["atime_ns"], after["atime_ns"],
+                            "no-atime counterexample not reproduced on this filesystem")
 
     def test_fd_read(self):
         self._observe_read("fd-read", lambda fd: os.read(fd, 4096))
@@ -154,6 +156,7 @@ class AtimeBoundaryTests(unittest.TestCase):
             os.lseek(dfd, 0, os.SEEK_SET)
             self.assertEqual(os.read(dfd, 4096), b"original payload\n" * 64)
             evidence("fcopyfile-data", before, fields(self.fd), content_correct=True)
+            self.assertNotEqual(before["atime_ns"], fields(self.fd)["atime_ns"])
         finally:
             os.close(dfd)
 
@@ -201,7 +204,10 @@ class AtimeBoundaryTests(unittest.TestCase):
                          native_attrs_equal=(source_xattrs == clone_xattrs))
             finally:
                 os.close(cfd)
-            os.pwrite(self.fd, b"X" * 8, 0)
+            subprocess.run(
+                [sys.executable, "-c", "import os,sys; os.pwrite(int(sys.argv[1]), b'X'*8, 0)", str(self.fd)],
+                pass_fds=(self.fd,), check=True,
+            )
             cfd = os.open(clone, os.O_RDONLY | os.O_NOFOLLOW)
             try:
                 self.assertEqual(os.read(cfd, 8), b"original")
@@ -222,11 +228,25 @@ class AtimeBoundaryTests(unittest.TestCase):
             fn = _native("fclonefileat", ctypes.c_int,
                          (ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32))
             _call(fn, self.fd, clone_dir, b"race", CLONE_ACL)
-            os.unlink(self.area / "race")
             forged = b"X" * source_before["size"]
-            (self.area / "race").write_bytes(forged)
-            os.chmod(self.area / "race", source_before["mode"])
-            os.utime(self.area / "race", ns=(source_before["atime_ns"], source_before["mtime_ns"]))
+            # An actual same-UID peer runs in the clone-return/open interval.
+            # It opens the 0700 directory itself: no source/clone fd is gifted.
+            peer = """import json,os,sys
+directory = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+info = json.loads(sys.argv[2])
+os.unlink('race', dir_fd=directory)
+fd = os.open('race', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+os.write(fd, b'X' * info['size'])
+os.fchmod(fd, info['mode'])
+os.utime(fd, ns=(info['atime_ns'], info['mtime_ns']))
+os.close(fd)
+os.close(directory)
+print(json.dumps({'uid': os.getuid(), 'pid': os.getpid()}))
+"""
+            actor = json.loads(subprocess.check_output(
+                [sys.executable, "-c", peer, str(self.area), json.dumps(source_before)], text=True,
+            ))
+            self.assertEqual(actor["uid"], os.getuid())
             fake = os.open(self.area / "race", os.O_RDONLY | os.O_NOFOLLOW)
             try:
                 fake_info = fields(fake)
@@ -237,32 +257,69 @@ class AtimeBoundaryTests(unittest.TestCase):
                 os.close(fake)
             source_after = fields(self.fd)
             evidence("clone-return-to-open-substitution", source_before, source_after,
-                     fake=fake_info, opened_data="same-length forged payload",
+                     actor=actor, fake=fake_info, opened_data="same-length forged payload",
                      warning="fstat-after-open cannot authenticate clone inode")
             self.assertEqual(source_before, source_after)
         finally:
             os.close(clone_dir)
 
-    def test_flags_xattrs_resourcefork_and_writer_restore_leave_ctime_witness(self):
-        self.fresh()
-        original = fields(self.fd)
-        original_data = os.pread(self.fd, 4096, 0)
-        flag = _native("fchflags", ctypes.c_int, (ctypes.c_int, ctypes.c_uint32))
-        _call(flag, self.fd, UF_HIDDEN)
-        _call(flag, self.fd, 0)
-        M.xattr_set(self.fd, "com.apple.ResourceFork", b"temporary-resource")
-        M.xattr_remove(self.fd, "com.apple.ResourceFork")
-        os.pwrite(self.fd, b"Z" * 8, 0)
-        os.pwrite(self.fd, original_data[:8], 0)
-        os.utime(self.fd, ns=(original["atime_ns"], original["mtime_ns"]))
-        after = fields(self.fd)
-        evidence("flags-xattr-resourcefork-writer-restore", original, after,
-                 content_restored=(os.pread(self.fd, 4096, 0) == original_data),
-                 interpretation="ctime is the remaining mutation witness; utime cannot erase it")
-        self.assertEqual(os.pread(self.fd, 4096, 0), original_data)
-        self.assertNotEqual(original["ctime_ns"], after["ctime_ns"])
+    def test_peer_metadata_restore_keeps_ctime_witness(self):
+        peer = """import ctypes,json,os,runpy,subprocess,sys
+fd,kind,path,helper = int(sys.argv[1]),sys.argv[2],sys.argv[3],sys.argv[4]
+m = runpy.run_path(helper)
+lib = ctypes.CDLL(None, use_errno=True)
+def check(result):
+    if result == -1: raise OSError(ctypes.get_errno(), 'native fixture mutation failed')
+if kind == 'flags':
+    flags = os.fstat(fd).st_flags
+    lib.fchflags.argtypes = [ctypes.c_int,ctypes.c_uint32]
+    check(lib.fchflags(fd, flags | 0x8000))
+    check(lib.fchflags(fd, flags))
+elif kind in ('xattr','resourcefork'):
+    name = 'com.flywheel.history' if kind == 'xattr' else 'com.apple.ResourceFork'
+    m['xattr_set'](fd,name,b'temporary value')
+    m['xattr_remove'](fd,name)
+elif kind == 'data':
+    os.pwrite(fd,b'Z'*8,0)
+    os.pwrite(fd,b'original',0)
+elif kind == 'acl':
+    lib.acl_get_fd_np.argtypes = [ctypes.c_int,ctypes.c_int]
+    lib.acl_get_fd_np.restype = ctypes.c_void_p
+    lib.acl_set_fd_np.argtypes = [ctypes.c_int,ctypes.c_void_p,ctypes.c_int]
+    lib.acl_free.argtypes = [ctypes.c_void_p]
+    original = lib.acl_get_fd_np(fd,0x100)
+    if not original: raise OSError(ctypes.get_errno(), 'fixture ACL unavailable')
+    try:
+        subprocess.run(['chmod','+a','user:root allow read',path],check=True)
+        check(lib.acl_set_fd_np(fd,original,0x100))
+    finally: lib.acl_free(original)
+else: raise AssertionError(kind)
+print(json.dumps({'uid':os.getuid(),'pid':os.getpid()}))
+"""
+        for kind in ("flags", "xattr", "resourcefork", "data", "acl"):
+            with self.subTest(kind=kind):
+                self.fresh()
+                original = fields(self.fd)
+                attrs = M.xattrs(self.fd)
+                actor = json.loads(subprocess.check_output(
+                    [sys.executable, "-c", peer, str(self.fd), kind, str(self.source), str(HELPER)],
+                    pass_fds=(self.fd,), text=True,
+                ))
+                self.assertEqual(actor["uid"], os.getuid())
+                after_peer = fields(self.fd)
+                self.assertNotEqual(original["ctime_ns"], after_peer["ctime_ns"])
+                os.utime(self.fd, ns=(original["atime_ns"], original["mtime_ns"]))
+                after_restore = fields(self.fd)
+                evidence("peer-" + kind + "-restore", original, after_restore,
+                         actor=actor, after_peer=after_peer,
+                         warning="own utime does not provide provenance for the final ctime")
+                self.assertNotEqual(original["ctime_ns"], after_restore["ctime_ns"])
+                self.assertEqual({k: v for k, v in original.items() if k != "ctime_ns"},
+                                 {k: v for k, v in after_restore.items() if k != "ctime_ns"})
+                self.assertEqual(M.xattrs(self.fd), attrs)
+                self.assertEqual(os.pread(self.fd, 4096, 0), b"original payload\n" * 64)
 
-    def test_acl_native_fd_probe_changes_ctime(self):
+    def test_acl_write_changes_ctime_without_mode_change(self):
         self.fresh()
         acl_get = getattr(LIBC, "acl_get_fd_np", None)
         acl_text = getattr(LIBC, "acl_to_text", None)
@@ -274,6 +331,7 @@ class AtimeBoundaryTests(unittest.TestCase):
         acl_free.restype, acl_free.argtypes = ctypes.c_int, [ctypes.c_void_p]
         before = fields(self.fd)
         subprocess.run(["chmod", "+a", "user:root allow read", str(self.source)], check=True)
+        after_write = fields(self.fd)
         acl = acl_get(self.fd, 0x100)
         if not acl:
             self.fail("native acl_get_fd_np did not read fixture ACL")
@@ -285,9 +343,12 @@ class AtimeBoundaryTests(unittest.TestCase):
         finally:
             acl_free(acl)
         after = fields(self.fd)
-        evidence("native-acl-fd", before, after, acl_text_bytes=n.value,
+        evidence("acl-write-then-native-fd-read", before, after_write, acl_text_bytes=n.value,
                  mode_changed=(before["mode"] != after["mode"]))
-        self.assertNotEqual(before["ctime_ns"], after["ctime_ns"])
+        evidence("native-acl-read-only", after_write, after)
+        self.assertNotEqual(before["ctime_ns"], after_write["ctime_ns"])
+        self.assertEqual(before["mode"], after_write["mode"])
+        self.assertEqual(after_write, after)
 
 
 if __name__ == "__main__":
