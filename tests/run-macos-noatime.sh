@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Isolated GitHub-hosted macOS test volume; never run against a user volume.
-set -euo pipefail
+set -euxo pipefail
 [[ "$(uname -s)" == Darwin ]] || { echo 'ERROR: this test requires Darwin.' >&2; exit 2; }
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 AREA="$(mktemp -d -t flywheel-noatime)"
@@ -23,8 +23,8 @@ cleanup() {
 }
 trap cleanup EXIT
 mkdir "$VOLUME"
-hdiutil create -size 256m -fs APFS -format UDRW -volname FlywheelNoAtime "$IMAGE" -quiet
-hdiutil attach "$IMAGE" -nobrowse -mountpoint "$VOLUME" -mountOptions noatime -quiet
+hdiutil create -size 512m -fs APFS -format UDRW -volname FlywheelNoAtime "$IMAGE"
+hdiutil attach "$IMAGE" -nobrowse -mountpoint "$VOLUME" -mountOptions noatime
 MOUNTED=1
 mount | grep -F " on $VOLUME " | grep -E '(^|[, (])noatime([,) ]|$)'
 mkdir "$VOLUME/tmp"

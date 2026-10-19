@@ -184,8 +184,9 @@ class DarwinMetadataContractTests(unittest.TestCase):
         subprocess.run(["chmod", "+a", "user:root allow read", str(self.target)], check=True)
 
     def propose(self):
-        M.proposal_command(str(self.project), ".claude/settings.json", str(self.prefix))
-        return json.loads((self.prefix.parent / "settings.identity.json").read_text())
+        relative = self.target.relative_to(self.project).as_posix()
+        M.proposal_command(str(self.project), relative, str(self.prefix))
+        return json.loads(pathlib.Path(str(self.prefix) + ".identity.json").read_text())
 
     def assert_attrs(self, path):
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)

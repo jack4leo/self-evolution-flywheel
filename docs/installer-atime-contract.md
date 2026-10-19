@@ -14,6 +14,8 @@
 
 预检的两套 JSON 读取使用同一 helper，不再各自 `utime`。确认基线保存原 bytes 和完整版本；完整 diff 显示前后绑定原始副本与 proposed staging 的版本。CLI 应用还要复核该展示记录，拒绝显示后被改写、恢复内容但 ctime 已变化、替换 inode 或丢失记录的提案。应用原件和最终新 inode 的路径/版本检查在 staging 与 journal 写入后再次执行，而不是把准备 staging 的时间当作已验证的窗口。
 
+**独立 review 的另一项未关闭问题：** 当前展示记录是私有临时目录里的可写 manifest，不是同 UID 的安全边界。攻击者若能同时重写提案材料和 manifest，上述比较只证明与后来读到的记录一致，不能证明与终端实际展示一致；原始 identity 文件也需要同一受信会话绑定。必须把授权版本固定到不可由文件系统写者重写的会话状态，并覆盖 manifest/原始记录共同篡改，才能宣称同 UID 威胁模型下的完整展示授权。这里的检查不能作为已完成该证明的证据。
+
 ## Darwin 元数据不是只有 xattrs
 
 ACL 使用 [Apple 的原生 fd 接口和二进制格式](https://github.com/apple-oss-distributions/Libc/blob/main/include/sys/acl.h)读取、复制和重新验证，包含 ACL-wide flags、ACE flags、权限、GUID 及顺序。只有原生 `ENOENT` 被明确表示为无 ACL；其他错误不是空 ACL。传给无长度参数的 `acl_copy_int_native` 前，验证序列化 header、条目数和完整长度。若新 staging 继承了 ACL，而原件没有 ACL，当前实现不能证明安全移除时直接拒绝，不把空 ACL 当作 absence。
