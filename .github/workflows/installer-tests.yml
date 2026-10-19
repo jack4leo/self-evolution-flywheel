@@ -24,9 +24,50 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Diagnose snapshot timestamps against the unchanged main baseline
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, subprocess, tempfile, types
+          baseline = "9d04f1b4939f53125f92b718ad8d908b744ffc80"
+          helper = ".agent-maintenance/installer-transaction.py"
+          fields = ("st_ino", "st_nlink", "st_size", "st_mode", "st_uid", "st_gid",
+                    "st_atime_ns", "st_mtime_ns", "st_ctime_ns")
+          for label, source in (
+              ("main baseline", subprocess.check_output(["git", "show", baseline + ":" + helper])),
+              ("PR head", pathlib.Path(helper).read_bytes()),
+          ):
+              module = types.ModuleType("snapshot_probe")
+              exec(compile(source, helper, "exec"), module.__dict__)
+              with tempfile.TemporaryDirectory(prefix="snapshot-probe-") as name:
+                  root = pathlib.Path(name).resolve()
+                  target = root / "AGENTS.md"
+                  target.write_bytes(b"isolated timestamp probe\n")
+                  parent = os.open(root, module.DIR_FLAGS)
+                  fd = module.open_existing(parent, target.name)
+                  try:
+                      before = os.fstat(fd)
+                      try:
+                          module.confirmation_snapshot(fd, parent)
+                          print(label, "snapshot accepted", flush=True)
+                      except (OSError, module.InstallError) as error:
+                          print(label, "snapshot refused:", error, flush=True)
+                      after = os.fstat(fd)
+                      print(label, "changed fields:", {
+                          field: [getattr(before, field), getattr(after, field)]
+                          for field in fields if getattr(before, field) != getattr(after, field)
+                      }, flush=True)
+                  finally:
+                      os.close(fd)
+                      os.close(parent)
+          PY
       - name: Test native descriptor xattrs with Python APIs absent
+        if: ${{ !cancelled() }}
         run: python3 tests/test-installer-xattrs.py -v
       - name: Test confirmed installer and retry with real xattrs
+        if: ${{ !cancelled() }}
         run: python3 tests/test-installer-xattr-install.py -v
       - name: Test confirmation and recovery identity boundaries
+        if: ${{ !cancelled() }}
         run: python3 tests/test-installer-confirmation-transaction.py -v
