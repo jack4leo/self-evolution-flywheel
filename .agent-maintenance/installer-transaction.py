@@ -315,9 +315,14 @@ def apply_metadata(fd, values):
 
 def new_temp(parent_fd, name, data, values, temporary_name=None, preserve_on_failure=False):
     temporary = temporary_name or f".{name}.flywheel-{os.getpid()}-{secrets.token_hex(6)}"
+    # Confirmation snapshots inspect this same descriptor after staging. On an
+    # atime-enabled filesystem, a read/utime restore changes ctime itself and
+    # would look like an external write. The newly created inode belongs to us,
+    # so Linux O_NOATIME needs no privilege escalation. Other paths are unchanged.
+    noatime = getattr(os, "O_NOATIME", 0) if preserve_on_failure else 0
     fd = os.open(
         temporary,
-        os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | NOFOLLOW,
+        os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | NOFOLLOW | noatime,
         0o600,
         dir_fd=parent_fd,
     )

@@ -195,6 +195,34 @@ class ConfirmationTransactionTests(unittest.TestCase):
         self.assertIn('recovery backup', result.stderr)
         self.assertEqual(backup.read_bytes(), b'{"user":true}\n')
 
+    @unittest.skipUnless(sys.platform.startswith('linux') and pathlib.Path('/dev/shm').is_dir(),
+                         'requires a Linux atime-enabled temporary filesystem')
+    def test_confirmation_on_atime_enabled_filesystem(self):
+        with tempfile.TemporaryDirectory(prefix='confirmation-atime-', dir='/dev/shm') as name:
+            area = pathlib.Path(name)
+            probe = area / 'probe'
+            probe.write_bytes(b'probe')
+            os.utime(probe, ns=(1, 1))
+            probe.read_bytes()
+            if probe.stat().st_atime_ns == 1:
+                self.skipTest('/dev/shm is mounted noatime')
+            project = area / 'project'
+            project.mkdir()
+            target = project / 'AGENTS.md'
+            target.write_bytes(b'original\n')
+            os.utime(target, ns=(1, 1))
+            prefix = area / 'proposal'
+            stage = area / 'stage'
+            stage.write_bytes(b'confirmed\n')
+            result = run('proposal', project, 'AGENTS.md', prefix)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result = run('apply-proposal', project, 'AGENTS.md', prefix, stage, area / 'state.json')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(target.stat().st_atime_ns, 1)
+            self.assertEqual(target.read_bytes(), b'confirmed\n')
+            backup = next(project.glob('.AGENTS.md.confirm-backup-*'))
+            self.assertEqual(backup.read_bytes(), b'original\n')
+
 
 if __name__ == "__main__":
     unittest.main()
