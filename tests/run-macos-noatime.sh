@@ -4,6 +4,7 @@ set -euxo pipefail
 [[ "$(uname -s)" == Darwin ]] || { echo 'ERROR: this test requires Darwin.' >&2; exit 2; }
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 AREA="$(mktemp -d -t flywheel-noatime)"
+AREA="$(cd "$AREA" && pwd -P)"
 IMAGE="$AREA/fixture.dmg"
 VOLUME="$AREA/volume"
 MOUNTED=0
@@ -23,7 +24,7 @@ cleanup() {
 }
 trap cleanup EXIT
 mkdir "$VOLUME"
-hdiutil create -size 512m -fs APFS -format UDRW -volname FlywheelNoAtime "$IMAGE"
+hdiutil create -size 512m -fs APFS -volname FlywheelNoAtime "$IMAGE"
 hdiutil attach "$IMAGE" -nobrowse -mountpoint "$VOLUME" -mountOptions noatime
 MOUNTED=1
 mount | grep -F " on $VOLUME " | grep -E '(^|[, (])noatime([,) ]|$)'

@@ -17,6 +17,17 @@ jobs:
         run: python3 scripts/freeze-review-range.py --validate-policy docs/automation/range-exclusions.json
       - name: Run complete installer regression tests
         run: bash tests/test-install.sh
+      - name: Run every independent Python suite without hiding earlier failures
+        if: ${{ !cancelled() }}
+        env:
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          status=0
+          for suite in tests/test-*.py tests/test_lesson_promotions.py; do
+            echo "===== $suite ====="
+            python3 "$suite" -v || status=1
+          done
+          exit "$status"
       - name: Test Lesson promotion validator
         if: ${{ !cancelled() }}
         run: python3 tests/test_lesson_promotions.py
