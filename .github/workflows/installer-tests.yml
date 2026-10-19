@@ -71,3 +71,11 @@ jobs:
       - name: Test confirmation and recovery identity boundaries
         if: ${{ !cancelled() }}
         run: python3 tests/test-installer-confirmation-transaction.py -v
+
+  macos-atime-boundary-probes:
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Probe timestamps and candidate readers in isolated fixtures
+        run: python3 tests/test-macos-atime-boundary.py -v
