@@ -115,7 +115,15 @@ class ConfirmationTests(unittest.TestCase):
             self.assertIn(b'--- .claude/settings.json (current)', output)
             self.assertIn(b'+++ .claude/settings.json (proposed)', output)
             self.assertIn(b'+', output)
-            self.assertEqual(json.loads(self.settings.read_bytes()), self.config)
+            # This observer runs after the identity snapshot. Do not mutate
+            # atime ourselves and turn a positive test into a metadata race.
+            # Field preservation is also checked after the confirmed update.
+            if hasattr(os, 'O_NOATIME'):
+                fd = os.open(self.settings, os.O_RDONLY | os.O_NOATIME)
+                try:
+                    self.assertEqual(json.loads(os.read(fd, 1024 * 1024)), self.config)
+                finally:
+                    os.close(fd)
         code, output, sent = terminal(self.command(), ['y'], inspect)
         self.assertEqual(sent, 1, output)
         self.assertEqual(code, 0, output)
