@@ -63,7 +63,7 @@ with tempfile.TemporaryDirectory(prefix='verify-noatime-') as name:
         os.close(fd)
 PY
 status=0
-for suite in test-installer-atime-contract.py test-installer-atime-interaction.py test-installer-xattrs.py test-installer-xattr-install.py test-installer-confirmation.py test-installer-confirmation-transaction.py test-macos-metadata-contract.py; do
+for suite in test-installer-atime-contract.py test-installer-supported-ctime.py test-installer-publication-version.py test-installer-atime-interaction.py test-installer-xattrs.py test-installer-xattr-install.py test-installer-confirmation.py test-installer-confirmation-transaction.py test-macos-metadata-contract.py; do
   python3 "$ROOT/tests/$suite" -v || status=1
 done
 exit "$status"

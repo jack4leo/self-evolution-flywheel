@@ -99,7 +99,9 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
       - name: Verify sole-writer exchange and strict pre-exchange ctime refusal
-        run: python3 tests/test-installer-supported-ctime.py -v
+        run: |
+          python3 tests/test-installer-supported-ctime.py -v
+          python3 tests/test-installer-publication-version.py -v
 
   strict-ctime-contract:
     name: Unsupported same-UID race diagnostic (${{ matrix.os }})
