@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Descriptor-relative file operations and conservative rollback for install.sh."""
+"""Internal file-operation protocol for install.sh, not a standalone installer.
+
+The shell entry owns interactive authorization; these operations (like copy and
+rollback) assume a trusted caller already authorized the requested local write.
+They enforce filesystem safety, not a security boundary against the local user.
+"""
 
 import base64
 import ctypes
@@ -308,11 +313,16 @@ def apply_metadata(fd, values):
         raise InstallError(f"could not safely preserve file metadata: {exc}") from exc
 
 
-def new_temp(parent_fd, name, data, values):
-    temporary = f".{name}.flywheel-{os.getpid()}-{secrets.token_hex(6)}"
+def new_temp(parent_fd, name, data, values, temporary_name=None, preserve_on_failure=False):
+    temporary = temporary_name or f".{name}.flywheel-{os.getpid()}-{secrets.token_hex(6)}"
+    # Confirmation snapshots inspect this same descriptor after staging. On an
+    # atime-enabled filesystem, a read/utime restore changes ctime itself and
+    # would look like an external write. The newly created inode belongs to us,
+    # so Linux O_NOATIME needs no privilege escalation. Other paths are unchanged.
+    noatime = getattr(os, "O_NOATIME", 0) if preserve_on_failure else 0
     fd = os.open(
         temporary,
-        os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | NOFOLLOW,
+        os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | NOFOLLOW | noatime,
         0o600,
         dir_fd=parent_fd,
     )
@@ -328,10 +338,13 @@ def new_temp(parent_fd, name, data, values):
         return temporary, fd, expected
     except Exception:
         os.close(fd)
-        try:
-            os.unlink(temporary, dir_fd=parent_fd)
-        except OSError:
-            pass
+        if preserve_on_failure:
+            print(f"PRESERVED confirmation staging/recovery entry: {temporary}", file=sys.stderr)
+        else:
+            try:
+                os.unlink(temporary, dir_fd=parent_fd)
+            except OSError:
+                pass
         raise
 
 
@@ -801,6 +814,17 @@ def rollback(root, state_path):
                     print(f"PRESERVED file; destination directory moved or changed before rollback: {relative}", file=sys.stderr)
                     incomplete = True
                     continue
+                if operation.get("confirmation_backup"):
+                    # A confirmed exchange has an old inode at the recovery
+                    # name.  There is no safe CAS-based rollback: moving the
+                    # active entry could overwrite a concurrent writer, while
+                    # deleting the backup could destroy the original.
+                    print(
+                        f"PRESERVED confirmed update and recovery backup; rollback requires manual review: {relative}",
+                        file=sys.stderr,
+                    )
+                    incomplete = True
+                    continue
                 current = signature_at(parent_fd, name)
                 if current is None:
                     continue
@@ -873,6 +897,245 @@ def snapshot_command(root, relative, output):
             pass
 
 
+def confirmation_snapshot(fd, parent_fd):
+    """Return a complete, re-checkable snapshot of one uniquely-owned file."""
+    before = os.fstat(fd)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise InstallError("confirmation target must be a regular file with exactly one link")
+    data = read_open_file(fd)
+    after = os.fstat(fd)
+    fields = ("st_dev", "st_ino", "st_size", "st_mode", "st_uid", "st_gid",
+              "st_nlink", "st_atime_ns", "st_mtime_ns", "st_ctime_ns")
+    if any(getattr(before, field) != getattr(after, field) for field in fields):
+        raise InstallError("file changed while the confirmation snapshot was read")
+    attrs = xattrs(fd)
+    return {
+        "inode": {"device": after.st_dev, "number": after.st_ino, "nlink": after.st_nlink},
+        "content": {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data)},
+        "metadata": {
+            "mode": stat.S_IMODE(after.st_mode), "uid": after.st_uid, "gid": after.st_gid,
+            "atime_ns": after.st_atime_ns, "mtime_ns": after.st_mtime_ns,
+            "ctime_ns": after.st_ctime_ns,
+            "xattrs": attrs if attrs is not None else {},
+            "xattrs_supported": attrs is not None,
+        },
+        "parent": {"device": os.fstat(parent_fd).st_dev, "number": os.fstat(parent_fd).st_ino},
+    }, data
+
+
+CONFIRMATION_PATHS = {"AGENTS.md", ".claude/settings.json"}
+
+
+def validate_confirmation_path(relative):
+    if relative not in CONFIRMATION_PATHS:
+        raise InstallError(f"confirmation transactions are not permitted for {relative!r}")
+
+
+def confirmation_identity_matches(actual, expected):
+    """Compare a pathname after rename without treating rename's ctime as data drift."""
+    if not actual or not expected:
+        return False
+    for section, fields in (
+        ("inode", ("device", "number")),
+        ("content", ("sha256", "size")),
+        ("metadata", ("mode", "uid", "gid", "atime_ns", "mtime_ns", "xattrs", "xattrs_supported")),
+    ):
+        left, right = actual.get(section, {}), expected.get(section, {})
+        if any(left.get(field) != right.get(field) for field in fields):
+            return False
+    return True
+
+
+def _write_bytes_atomic(path, data):
+    temporary = f"{path}.tmp-{os.getpid()}-{secrets.token_hex(6)}"
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | NOFOLLOW, 0o600)
+        try:
+            view = memoryview(data)
+            while view:
+                count = os.write(fd, view)
+                view = view[count:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def proposal_command(root, relative, prefix):
+    validate_confirmation_path(relative)
+    root_fd = open_root(root)
+    parent_fd = None
+    fd = None
+    try:
+        parent_fd, name = open_parent(root_fd, relative, False, {"created_directories": []}, prefix + ".unused")
+        if not verify_parent(root, root_fd, relative, parent_fd):
+            raise InstallError("target parent changed while preparing confirmation snapshot")
+        fd = open_existing(parent_fd, name, reject_hardlinks=True)
+        if fd is None:
+            raise InstallError(f"file is missing: {relative}")
+        snapshot, data = confirmation_snapshot(fd, parent_fd)
+        _write_bytes_atomic(prefix + ".original", data)
+        _write_bytes_atomic(prefix + ".identity.json", (json.dumps(snapshot, indent=2, sort_keys=True) + "\n").encode())
+        print("PROPOSAL SAVED")
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        os.close(root_fd)
+
+
+def rename_exchange(parent_fd, left, right):
+    if sys.platform == "darwin":
+        function_name = "renameatx_np"  # RENAME_SWAP
+    elif sys.platform.startswith("linux"):
+        function_name = "renameat2"  # RENAME_EXCHANGE
+    else:
+        raise InstallError("atomic exchange is unavailable on this platform; refusing confirmed write")
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        function = getattr(libc, function_name)
+    except AttributeError as exc:
+        raise InstallError("atomic exchange is unavailable; refusing confirmed write") from exc
+    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    function.restype = ctypes.c_int
+    if function(parent_fd, os.fsencode(left), parent_fd, os.fsencode(right), 0x2) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), right)
+
+
+def apply_proposal_command(root, relative, prefix, staged, state_path):
+    validate_confirmation_path(relative)
+    try:
+        with open(prefix + ".identity.json", encoding="utf-8") as handle:
+            expected = json.load(handle)
+        with open(prefix + ".original", "rb") as handle:
+            original_data = handle.read()
+        if hashlib.sha256(original_data).hexdigest() != expected["content"]["sha256"]:
+            raise InstallError("confirmation baseline does not match its snapshot")
+        if not expected["metadata"]["xattrs_supported"]:
+            raise InstallError("cannot preserve unknown extended attributes; refusing confirmed update")
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise InstallError(f"invalid confirmation snapshot: {exc}") from exc
+    root_fd = open_root(root)
+    parent_fd = None
+    target_fd = None
+    stage_fd = None
+    temp_fd = None
+    backup = None
+    exchanged = False
+    try:
+        parent_fd, name = open_parent(root_fd, relative, False, {"created_directories": []}, prefix + ".unused")
+        if not verify_parent(root, root_fd, relative, parent_fd):
+            raise InstallError("target parent was replaced after confirmation")
+        target_fd = open_existing(parent_fd, name, reject_hardlinks=True)
+        if target_fd is None:
+            raise InstallError("confirmed target disappeared")
+        current, _ = confirmation_snapshot(target_fd, parent_fd)
+        if current != expected or current["parent"] != expected.get("parent"):
+            raise InstallError("confirmed file or parent changed; refusing update")
+        stage_fd = os.open(staged, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
+        stage_info = os.fstat(stage_fd)
+        if not stat.S_ISREG(stage_info.st_mode) or stage_info.st_nlink != 1:
+            raise InstallError("staged file must be a regular file with exactly one link")
+        stage_data = read_open_file(stage_fd)
+        stage_after = os.fstat(stage_fd)
+        if stage_after.st_size != len(stage_data) or stage_after.st_ino != stage_info.st_ino:
+            raise InstallError("staged file changed while being read")
+        if not verify_parent(root, root_fd, relative, parent_fd):
+            raise InstallError("target parent changed before confirmed update")
+        # Re-open by pathname at the last safe boundary; a held fd pins the old
+        # inode and cannot detect pathname replacement.
+        latest_fd = open_existing(parent_fd, name, reject_hardlinks=True)
+        if latest_fd is None:
+            raise InstallError("confirmed target disappeared before update")
+        try:
+            latest, _ = confirmation_snapshot(latest_fd, parent_fd)
+        finally:
+            os.close(latest_fd)
+        if latest != expected:
+            raise InstallError("confirmed file changed before update")
+
+        os.close(target_fd)
+        target_fd = None
+
+        # The new file is created directly at its final recovery name.  After
+        # exchange that name is the displaced original; neither exchanged name
+        # is ever unlinked by cleanup.
+        backup = f".{name}.confirm-backup-{os.getpid()}-{secrets.token_hex(5)}"
+        temporary, temp_fd, new_expected = new_temp(
+            parent_fd, name, stage_data, expected["metadata"],
+            temporary_name=backup, preserve_on_failure=True,
+        )
+        if temporary != backup:
+            raise InstallError("staging name mismatch")
+        new_expected, _ = confirmation_snapshot(temp_fd, parent_fd)
+        state = load_state(state_path)
+        state["operations"].append({
+            "path": relative,
+            "status": "pending",
+            "old_expected": expected,
+            "expected": new_expected,
+            "confirmation_backup": backup,
+        })
+        save_state(state_path, state)
+        os.close(temp_fd)
+        temp_fd = None
+        rename_exchange(parent_fd, name, backup)
+        exchanged = True
+
+        # ctime changes on rename, so compare all stable identity/data fields
+        # while explicitly retaining inode identity and the displaced bytes.
+        displaced_fd = None
+        active_fd = None
+        try:
+            displaced_fd = open_existing(parent_fd, backup, reject_hardlinks=True)
+            active_fd = open_existing(parent_fd, name, reject_hardlinks=True)
+            if displaced_fd is None or active_fd is None:
+                raise InstallError("exchange did not leave both active and recovery entries")
+            displaced, _ = confirmation_snapshot(displaced_fd, parent_fd)
+            active, _ = confirmation_snapshot(active_fd, parent_fd)
+        finally:
+            if displaced_fd is not None:
+                os.close(displaced_fd)
+            if active_fd is not None:
+                os.close(active_fd)
+        if not confirmation_identity_matches(displaced, expected):
+            raise InstallError("exchange displaced inode or data did not match the confirmed original")
+        if not confirmation_identity_matches(active, new_expected):
+            raise InstallError("active pathname does not contain the staged inode or data")
+        if not verify_parent(root, root_fd, relative, parent_fd):
+            raise InstallError("target parent moved after confirmed update; recovery entries preserved")
+
+        state = load_state(state_path)
+        operation = state["operations"][-1]
+        operation["status"] = "applied"
+        operation["expected"] = active
+        operation["new_expected"] = active
+        save_state(state_path, state)
+        print(f"APPLIED (recovery backup: {backup})")
+    finally:
+        if stage_fd is not None:
+            os.close(stage_fd)
+        if target_fd is not None:
+            os.close(target_fd)
+        if temp_fd is not None:
+            os.close(temp_fd)
+        # Even before exchange, another process may replace the staging name.
+        # Never unlink it based on an earlier pathname/identity observation.
+        if backup is not None:
+            phase = "backup" if exchanged else "staging/recovery entry"
+            print(f"PRESERVED confirmation {phase}: {backup}", file=sys.stderr)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        os.close(root_fd)
+
+
 def main(argv):
     if not argv:
         fail("missing operation")
@@ -893,6 +1156,10 @@ def main(argv):
             save_state(argv[2], {"operations": [], "created_directories": []})
         elif command == "snapshot" and len(argv) == 4:
             snapshot_command(argv[1], argv[2], argv[3])
+        elif command == "proposal" and len(argv) == 4:
+            proposal_command(argv[1], argv[2], argv[3])
+        elif command == "apply-proposal" and len(argv) == 6:
+            apply_proposal_command(argv[1], argv[2], argv[3], argv[4], argv[5])
         elif command == "compare" and len(argv) == 4:
             return compare_command(argv[1], argv[2], argv[3])
         elif command == "copy" and len(argv) == 5:

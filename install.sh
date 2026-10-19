@@ -25,12 +25,12 @@ usage() {
 Usage: ./install.sh [--target DIR] [--no-hooks] [--bootstrap codex|claude]
 
 Install Self-Evolution Flywheel project guidance into an existing repository.
-Existing files are never overwritten. A different AGENTS.md is shown as a
-proposed diff and must be merged manually; the installer does not ask for
-confirmation when it cannot safely apply the change. Existing provider JSON is
-never rewritten: exact hooks are accepted, missing settings files are created,
-and if an existing settings file needs a hook added, only that provider's hook
-registration is skipped; the other provider is still validated independently.
+Existing files are preserved unless an AGENTS.md managed-routing change or
+an additive Claude settings hook merge is explicitly confirmed after its diff
+in an interactive terminal (y/N, default N). Without a terminal they are preserved.
+Existing Codex JSON still requires a manual merge. Exact hooks are accepted,
+missing settings files are created, and declining a settings merge skips only
+that provider; the other provider is still validated independently.
 Other template files are still installed when both settings files are valid.
 
 Options:
@@ -388,6 +388,8 @@ registered = any(
     for session in sessions
 )
 if os.path.lexists(filename) and not registered:
+    if provider == "claude":
+        sys.exit(12)  # Valid additive merge: offer it only after all preflights.
     print(
         f"NOTICE: existing {filename} needs a manual hook merge; it was preserved and startup-hook registration is skipped. Template files will still be installed.",
         file=sys.stderr,
@@ -400,6 +402,7 @@ PY
 # files. A valid conflict skips only that provider's hook registration.
 CODEX_HOOKS_ENABLED=0
 CLAUDE_HOOKS_ENABLED=0
+CLAUDE_MERGE_PROPOSAL=0
 hook_config_conflicts=()
 codex_preflight_error=0
 claude_preflight_error=0
@@ -418,7 +421,9 @@ if [[ "$INSTALL_HOOKS" == 1 ]]; then
     CLAUDE_HOOKS_ENABLED=1
   else
     preflight_status=$?
-    if ((preflight_status == 11)); then
+    if ((preflight_status == 12)); then
+      CLAUDE_MERGE_PROPOSAL=1
+    elif ((preflight_status == 11)); then
       hook_config_conflicts+=(".claude/settings.json")
     else
       claude_preflight_error=$preflight_status
@@ -448,7 +453,7 @@ fi
 # Detect predictable destination permission failures before writing any template
 # files or provider settings. This checks only paths that would actually change.
 preflight_write_access() {
-  python3 - "$SOURCE_DIR" "$TARGET_DIR" "$CODEX_HOOKS_ENABLED" "$CLAUDE_HOOKS_ENABLED" "${files[@]}" <<'PY'
+  python3 - "$SOURCE_DIR" "$TARGET_DIR" "$CODEX_HOOKS_ENABLED" "$((CLAUDE_HOOKS_ENABLED || CLAUDE_MERGE_PROPOSAL))" "${files[@]}" <<'PY'
 import json
 import errno
 import os
@@ -618,14 +623,14 @@ cat > "$managed_route_file" <<'ROUTE'
 ROUTE
 
 display_managed_diff() {
-  python3 - "$1" "$2" <<'PY'
+  python3 - "$1" "$2" "${3:-AGENTS.md}" <<'PY'
 import subprocess
 import sys
 import unicodedata
 
 try:
     process = subprocess.Popen(
-        ["diff", "-u", "-L", "AGENTS.md (current)", "-L", "AGENTS.md (proposed)", *sys.argv[1:]],
+        ["diff", "-u", "-L", f"{sys.argv[3]} (current)", "-L", f"{sys.argv[3]} (proposed)", *sys.argv[1:3]],
         stdout=subprocess.PIPE,
     )
 except OSError as exc:
@@ -662,16 +667,54 @@ sys.exit(process.wait())
 PY
 }
 
+# Never read script stdin: it can still contain a curl-piped installer. Require
+# visible output and a foreground controlling terminal, and read only /dev/tty.
+confirm_proposal() {
+  python3 - "$1" <<'PY'
+import os
+import sys
+
+fd = None
+try:
+    if not os.isatty(1):
+        raise OSError("output is not a terminal")
+    fd = os.open("/dev/tty", os.O_RDWR | getattr(os, "O_NOCTTY", 0))
+    if not os.isatty(fd) or os.tcgetpgrp(fd) != os.getpgrp():
+        raise OSError("not the foreground terminal")
+except OSError:
+    if fd is not None:
+        os.close(fd)
+    print(f"PRESERVED {sys.argv[1]}: no interactive terminal; merge the reviewed block manually or rerun interactively.", file=sys.stderr)
+    sys.exit(1)
+
+try:
+    os.write(fd, f"Apply this exact change to {sys.argv[1]}? [y/N] ".encode())
+    answer = bytearray()
+    while True:
+        char = os.read(fd, 1)
+        if not char or char == b"\n":
+            break
+        answer.extend(char)
+    approved = bytes(answer) in (b"y", b"Y")
+finally:
+    os.close(fd)
+if not approved:
+    print(f"PRESERVED {sys.argv[1]}: confirmation declined (default N); merge the reviewed block manually if needed.", file=sys.stderr)
+sys.exit(0 if approved else 1)
+PY
+}
+
 prepare_managed_agents() {
   local destination_path="$1"
-  local baseline="$work_dir/agents.original"
+  local proposal="$work_dir/agents"
+  local baseline="$proposal.original"
   local stage_file diff_status=0
 
   if ! command -v python3 >/dev/null 2>&1; then
     echo "PRESERVED existing file (Python 3 is required to safely manage AGENTS.md): AGENTS.md" >&2
     return 1
   fi
-  if ! python3 "$TRANSACTION_HELPER" snapshot "$TARGET_DIR" "AGENTS.md" "$baseline"; then
+  if ! python3 "$TRANSACTION_HELPER" proposal "$TARGET_DIR" "AGENTS.md" "$proposal"; then
     echo "PRESERVED existing file (could not snapshot it safely): AGENTS.md" >&2
     return 1
   fi
@@ -736,7 +779,17 @@ PY
     return 1
   fi
 
-  echo "PRESERVED AGENTS.md: automatic replacement is unavailable; merge the reviewed block manually." >&2
+  if confirm_proposal "AGENTS.md"; then
+    if python3 "$TRANSACTION_HELPER" apply-proposal "$TARGET_DIR" "AGENTS.md" "$proposal" "$stage_file" "$transaction_state"; then
+      echo "UPDATED managed routing in AGENTS.md (confirmed)"
+      rm -f "$stage_file"
+      return 0
+    fi
+    echo "ERROR: AGENTS.md confirmed update was not verified; inspect the current file and reported recovery state." >&2
+    retain_work_dir=1
+    rm -f "$stage_file"
+    return 5
+  fi
   rm -f "$stage_file"
   return 3
 }
@@ -760,11 +813,13 @@ for relative_path in "${files[@]}"; do
         :
       else
         managed_status=$?
-        echo "PRESERVED existing file (managed routing not applied): AGENTS.md"
-        conflicts+=("$relative_path")
-        if ((managed_status == 3)); then
-          manual_merge_required=1
+        if ((managed_status == 5)); then
+          echo "UNRESOLVED confirmed update: AGENTS.md (inspect current file and recovery entries)" >&2
+        else
+          echo "PRESERVED existing file (managed routing not applied): AGENTS.md"
         fi
+        conflicts+=("$relative_path")
+        manual_merge_required=1
       fi
       continue
     fi
@@ -821,11 +876,127 @@ merge_hook_config() {
   printf '%s %s\n' "$result" "$settings_path"
 }
 
+prepare_claude_merge() {
+  local proposal="$work_dir/claude"
+  local stage_file="$work_dir/claude.proposed.json"
+  local diff_status=0
+  python3 "$TRANSACTION_HELPER" proposal "$TARGET_DIR" ".claude/settings.json" "$proposal" || return 3
+  # Insert into the original text rather than round-tripping JSON: preserve
+  # unknown fields, numeric spelling/precision, existing hooks and formatting.
+  python3 - "$proposal.original" "$stage_file" "$TRANSACTION_HELPER" <<'PY'
+import importlib.util
+import json
+import sys
+from decimal import Decimal
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key!r}")
+        result[key] = value
+    return result
+
+try:
+    text = Path(sys.argv[1]).read_bytes().decode("utf-8")
+    decoder = json.JSONDecoder(object_pairs_hook=unique_object, parse_float=Decimal)
+    config = decoder.decode(text)
+    spec = importlib.util.spec_from_file_location("transaction", sys.argv[3])
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    helper.validate_config(decoder.decode(text), ".claude/settings.json")
+    if helper.hook_is_registered("claude", config.get("hooks", {}).get("SessionStart", [])):
+        Path(sys.argv[2]).write_bytes(text.encode("utf-8"))
+        sys.exit(0)
+
+    def skip(index):
+        while index < len(text) and text[index] in " \t\r\n":
+            index += 1
+        return index
+
+    def members(start):
+        index = skip(start + 1)
+        found = {}
+        while text[index] != "}":
+            key, index = decoder.raw_decode(text, index)
+            index = skip(index)
+            assert text[index] == ":"
+            first = skip(index + 1)
+            _, last = decoder.raw_decode(text, first)
+            found[key] = (first, last)
+            index = skip(last)
+            if text[index] == ",":
+                index = skip(index + 1)
+        return found, index
+
+    entry = helper.hook_entry("claude")
+    root_members, closing = members(skip(0))
+    if "hooks" not in root_members:
+        content = '"hooks": ' + json.dumps({"SessionStart": [entry]}, ensure_ascii=True, indent=2)
+        populated = bool(config)
+    else:
+        hooks_start, _ = root_members["hooks"]
+        hook_members, closing = members(hooks_start)
+        if "SessionStart" not in hook_members:
+            content = '"SessionStart": ' + json.dumps([entry], ensure_ascii=True, indent=2)
+            populated = bool(config["hooks"])
+        else:
+            _, last = hook_members["SessionStart"]
+            closing = last - 1
+            content = json.dumps(entry, ensure_ascii=True, indent=2)
+            populated = bool(config["hooks"]["SessionStart"])
+    newline = "\r\n" if "\r\n" in text else "\n"
+    content = content.replace("\n", newline)
+    inserted = ("," if populated else "") + newline + content + newline
+    updated = text[:closing] + inserted + text[closing:]
+    expected = config
+    expected.setdefault("hooks", {}).setdefault("SessionStart", []).append(entry)
+    assert decoder.decode(updated) == expected, "additive JSON proposal changed unrelated values"
+    Path(sys.argv[2]).write_bytes(updated.encode("utf-8"))
+except Exception as exc:
+    print(f"ERROR: cannot safely propose Claude hook merge: {exc}; original preserved.", file=sys.stderr)
+    sys.exit(3)
+PY
+  local stage_status=$?
+  ((stage_status == 0)) || return 3
+  if cmp -s "$proposal.original" "$stage_file"; then
+    echo "UNCHANGED .claude/settings.json (hook already registered)"
+    return 0
+  fi
+  echo "Proposed diff for .claude/settings.json (no changes applied yet):"
+  display_managed_diff "$proposal.original" "$stage_file" ".claude/settings.json" || diff_status=$?
+  ((diff_status <= 1)) || return 3
+  if ! confirm_proposal ".claude/settings.json"; then
+    return 11
+  fi
+  python3 "$TRANSACTION_HELPER" apply-proposal "$TARGET_DIR" ".claude/settings.json" "$proposal" "$stage_file" "$transaction_state" || return 3
+  echo "UPDATED .claude/settings.json (confirmed additive hook merge)"
+}
+
 if [[ "$CODEX_HOOKS_ENABLED" == 1 ]]; then
   merge_hook_config codex "$TARGET_DIR/.codex/hooks.json"
 fi
 if [[ "$CLAUDE_HOOKS_ENABLED" == 1 ]]; then
   merge_hook_config claude "$TARGET_DIR/.claude/settings.json"
+fi
+confirmation_error=0
+if ((CLAUDE_MERGE_PROPOSAL)); then
+  if prepare_claude_merge; then
+    CLAUDE_HOOKS_ENABLED=1
+  else
+    merge_status=$?
+    hook_config_conflicts+=(".claude/settings.json")
+    if ((merge_status == 11)); then
+      echo "NOTICE: .claude/settings.json preserved; this provider's startup-hook registration is skipped." >&2
+    else
+      echo "ERROR: Claude startup-hook registration is skipped; inspect current settings and any reported recovery entries." >&2
+      retain_work_dir=1
+      confirmation_error=1
+    fi
+  fi
 fi
 
 # All file and provider writes succeeded. Later notices, optional bootstrap launch,
@@ -941,8 +1112,12 @@ if ((template_entry_conflict)) && [[ -n "$BOOTSTRAP_AGENT" ]]; then
 fi
 
 if ((manual_merge_required)); then
-  echo "ERROR: installation incomplete: the reviewed AGENTS.md block was not applied because conditional replacement is unavailable; merge it manually." >&2
+  echo "ERROR: installation incomplete: the reviewed AGENTS.md block was not applied; merge it manually or rerun interactively." >&2
   exit 4
+fi
+if ((confirmation_error)); then
+  echo "ERROR: confirmed Claude hook merge could not be applied safely; inspect the preserved settings/recovery entries before retrying." >&2
+  exit 3
 fi
 
 release_target_lock() {
