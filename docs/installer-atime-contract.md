@@ -2,6 +2,14 @@
 
 **这份后续修复仍是草稿，不是已证明安全的 macOS 修复。** PR #30 已由维护者合并到 `main`（`9318f16a11c581661913d17b7371a108dc0e5154`）；本次工作从该提交另开分支，不修改已合并的 PR。允许读取自然更新 atime 可以消除原来的读后恢复时间问题，但不能解决原子交换本身与严格 ctime 契约之间的冲突。
 
+## Exclusive-Writer Operating Precondition
+
+The required operating procedure is defined in [Installation: pause other project writers](installation.md#required-safety-precondition-pause-other-project-writers). Before any read of existing `AGENTS.md` or Codex/Claude settings, the installer must be the sole writer of those configurations and the target directory tree. That condition must hold continuously through proposal display, confirmation, staging, exchange/publication, verification, and completion of any failure recovery. Close or pause other Claude/Codex sessions, editor auto-save/formatting, sync tools, generators, and other installers/scripts; verify that no running tasks can still write, including via open descriptors. Pausing project modifications means stopping **other writers**; the installer still performs its own transaction writes.
+
+If that condition cannot be guaranteed, do not automatically overwrite existing files: preserve the originals, decline or skip replacement proposals, and handle the changes manually after other writers have stopped. If recovery/rollback entries or a retained journal are present, inspect them and complete manual recovery **before another installation**; do not restart the installer to bypass unresolved recovery.
+
+This is an explicitly narrower operational threat model, enforced by the operator rather than by the code. An ordinary cooperative/advisory lock cannot prevent a non-cooperating same-UID writer from modifying files, directories, open inodes, or proposal records. The documented precondition does not prove resistance to such writers, close the final-check/exchange race, or solve the writable-manifest authorization issue below. The strict-ctime gate and installation/recovery regressions remain unchanged, with their failure evidence retained; this documentation update does not make the draft ready to merge.
+
 ## 唯一获准的副作用
 
 预检、比较、提案预览或读取现有 `AGENTS.md`、Codex/Claude settings 时，文件系统可能自然更新访问时间 **atime**。这也包括用户按 **N**、空输入、EOF、没有终端、提案不需要改动或安全检查最终拒绝更新的情况。noatime 挂载可能不更新它；安装器不要求 atime 一定发生变化。
@@ -43,7 +51,7 @@ BSD flags 单独读取和验证。当前只允许安全 staging 的 `UF_NODUMP`�
 
 普通身份记录新增持久 ctime、link count 和 Darwin 元数据，恢复检查继续严格。安装器自己 publish/link/rename 也可能改变 ctime；遇到历史 expected 不再匹配时保留 active、staging/recovery entry 和 journal，报告需要人工检查，而不是忽略 ctime 后删除或移动文件。确认交换产生的旧 inode 备份同样不自动删除或交换回去；已打开的写 fd 仍可能继续写它。
 
-在严格 ctime/不合作同 UID 写者的契约下，当前草稿不得合并或称为修复完成。安全出口是证明一个有明确版本条件的原子发布原语，或者另行取得更窄的威胁模型/管理前提授权；不能把用户对 atime 的同意解释成对 ctime 例外、合作写者或元数据缺口的同意。
+Under the strict-ctime/non-cooperating same-UID writer contract, this draft must not be merged or called a completed fix. The operator-required exclusive-writer precondition above now documents the authorized narrower operating model; it does not establish an atomic publication primitive with explicit version conditions, relax the strict-ctime gate, resolve installation/recovery failures, or authorize metadata gaps. Agreement to this operating procedure is not evidence that the existing implementation satisfies the stronger contract. Keep the PR in draft and retain the failing checks until the remaining failures are resolved separately.
 
 ## 如何验证
 
