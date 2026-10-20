@@ -76,7 +76,7 @@ class ConfirmationTests(unittest.TestCase):
         self.config = {'env': {'KEEP': 'yes'}, 'permissions': {'allow': ['Read']},
                        'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': 'echo stop'}]}],
                                  'SessionStart': [{'matcher': 'startup', 'extra': 123,
-                                                   'hooks': [{'type': 'command', 'command': 'echo hello', 'timeout': 7}]}]},
+                                                   'hooks': [{'type': 'command', 'command': 'echo flywheel user-owned', 'timeout': 7}]}]},
                        'unknown': {'nested': [False, None, 12]}}
 
     def command(self, no_hooks=False):
@@ -95,19 +95,13 @@ class ConfirmationTests(unittest.TestCase):
                                  'hooks': [{'type': 'command', 'command': COMMAND}]})
         self.assertEqual(actual, self.config)
 
-    def test_agents_yes_and_retry(self):
+    def test_unmarked_agents_fails_closed_without_prompt(self):
         self.agents.write_bytes(self.original)
         code, output, sent = terminal(self.command(True), ['y'])
-        self.assertEqual(sent, 1, output)
-        self.assertEqual(code, 0, output)
-        self.assertIn(b'--- AGENTS.md (current)', output)
-        self.assertIn(b'+++ AGENTS.md (proposed)', output)
-        self.assertTrue(self.agents.read_bytes().startswith(BEGIN))
-        self.assertTrue(self.agents.read_bytes().endswith(self.original))
-        first = self.agents.read_bytes()
-        code, output, sent = terminal(self.command(True), [])
-        self.assertEqual((code, sent), (0, 0), output)
-        self.assertEqual(self.agents.read_bytes(), first)
+        self.assertEqual(sent, 0, output)
+        self.assertEqual(code, 3, output)
+        self.assertEqual(self.agents.read_bytes(), self.original)
+        self.assertNotIn(b'[y/N]', output)
 
     def test_claude_yes_exact_diff_and_retry(self):
         self.existing_settings()
@@ -134,15 +128,14 @@ class ConfirmationTests(unittest.TestCase):
         self.assertEqual(self.settings.read_bytes(), first)
         self.assertTrue((self.project / '.codex/hooks.json').exists())
 
-    def test_refusal_default_and_non_yes(self):
+    def test_unmarked_agents_never_prompts_for_any_stdin_answer(self):
         for answer in ['n', '', 'yes', 'Yess', ' y ', 'N']:
             with self.subTest(answer=answer):
                 self.agents.write_bytes(self.original)
                 code, output, sent = terminal(self.command(True), [answer])
-                self.assertEqual((code, sent), (4, 1), output)
+                self.assertEqual((code, sent), (3, 0), output)
                 self.assertEqual(self.agents.read_bytes(), self.original)
-                self.assertIn(b'PRESERVED', output)
-                self.assertTrue((self.project / 'prompts/bootstrap-project.md').exists())
+                self.assertNotIn(b'[y/N]', output)
 
     def test_claude_decline_independent_provider(self):
         original = self.existing_settings()
@@ -164,7 +157,7 @@ class ConfirmationTests(unittest.TestCase):
             with self.subTest(original=original):
                 self.settings.write_bytes(original)
                 code, output, sent = terminal(self.command(), ['Y'])
-                self.assertEqual((code, sent), (0, 1), output)
+                self.assertEqual((code, sent), (0, 0), output)
                 updated = self.settings.read_bytes()
                 # Every old byte stays in order, with precisely one inserted span.
                 prefix = 0
@@ -184,12 +177,11 @@ class ConfirmationTests(unittest.TestCase):
         result = subprocess.run(['bash', str(ROOT / 'install.sh'), '--target', str(self.project)],
                                 input=b'y\ny\n', stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 start_new_session=True, timeout=30)
-        self.assertEqual(result.returncode, 4, result.stdout)
+        self.assertEqual(result.returncode, 3, result.stdout)
         self.assertNotIn(b'[y/N]', result.stdout)
-        self.assertIn(b'no interactive terminal', result.stdout)
         self.assertEqual(self.agents.read_bytes(), self.original)
         self.assertEqual(self.settings.read_bytes(), original_settings)
-        self.assertTrue((self.project / '.codex/hooks.json').exists())
+        self.assertFalse((self.project / '.codex/hooks.json').exists())
 
     def test_script_stdin_pipe_uses_controlling_terminal(self):
         self.agents.write_bytes(self.original)
@@ -206,16 +198,17 @@ class ConfirmationTests(unittest.TestCase):
                    ' PATH=' + shlex.quote(str(mockbin)) + ':"$PATH"; cat ' +
                    shlex.quote(str(ROOT / 'install.sh')) + ' | bash -s -- --no-hooks')
         code, output, sent = terminal(command, ['y'])
-        self.assertEqual((code, sent), (0, 1), output)
-        self.assertTrue(self.agents.read_bytes().startswith(BEGIN))
+        self.assertEqual((code, sent), (3, 0), output)
+        self.assertEqual(self.agents.read_bytes(), self.original)
+        self.assertNotIn(b'[y/N]', output)
 
     def test_confirmed_external_changes_preserved(self):
-        for relative in ['AGENTS.md', '.claude/settings.json']:
+        for relative in ['.claude/settings.json']:
             for replacement in [False, True]:
                 with self.subTest(relative=relative, replacement=replacement):
                     path = self.project / relative
                     path.parent.mkdir(exist_ok=True)
-                    path.write_bytes(self.original if relative == 'AGENTS.md' else b'{}\n')
+                    path.write_bytes(self.original if relative == 'AGENTS.md' else (json.dumps(self.config, indent=2) + '\n').encode())
                     external = b'# External update\n' if relative == 'AGENTS.md' else b'{"external":true}\n'
                     def change(_index, _output):
                         if replacement:
@@ -232,11 +225,9 @@ class ConfirmationTests(unittest.TestCase):
                     path.unlink()
 
     def test_both_confirmations_are_independent(self):
-        self.agents.write_bytes(self.original)
         self.existing_settings()
-        code, output, sent = terminal(self.command(), ['n', 'y'])
-        self.assertEqual((code, sent), (4, 2), output)
-        self.assertEqual(self.agents.read_bytes(), self.original)
+        code, output, sent = terminal(self.command(), ['y'])
+        self.assertEqual((code, sent), (0, 1), output)
         self.assert_added_hook_only()
 
     def test_invalid_other_provider_preflight_before_any_confirmation(self):
@@ -252,9 +243,8 @@ class ConfirmationTests(unittest.TestCase):
         self.agents.write_bytes(self.original)
         output_file = Path(self.area.name) / 'redirected.log'
         code, output, sent = terminal(self.command(True) + ' > ' + shlex.quote(str(output_file)) + ' 2>&1', [])
-        self.assertEqual((code, sent), (4, 0), output)
+        self.assertEqual((code, sent), (3, 0), output)
         self.assertEqual(self.agents.read_bytes(), self.original)
-        self.assertIn(b'no interactive terminal', output_file.read_bytes())
 
 
 if __name__ == '__main__':

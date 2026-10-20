@@ -183,16 +183,16 @@ class InstallerSecurityRegressionTests(unittest.TestCase):
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         docs = (REPO_ROOT / "docs/installation.md").read_text(encoding="utf-8")
         help_text = " ".join(help_result.stdout.split())
-        self.assertIn("explicitly confirmed after its diff", help_text)
-        self.assertIn("y/N, default N", help_text)
+        self.assertIn("ambiguous ownership requires a reviewed terminal confirmation", help_text)
+        self.assertIn("default N", help_text)
         self.assertIn("declining a settings merge skips only that provider", help_text)
         self.assertIn("Existing Codex JSON still requires a manual merge", help_text)
-        self.assertIn("only `y` or `Y` authorizes that change", readme)
-        self.assertIn("Declining, EOF, or no interactive terminal preserves the original", readme)
-        self.assertIn("skipping one provider does not block the other", readme)
-        self.assertIn("never script stdin", docs)
-        self.assertIn("no silent overwrite", docs)
-        self.assertIn("writes its diagnostic to stderr", docs)
+        self.assertIn("requires exact `y`/`Y` confirmation", readme)
+        self.assertIn("Existing custom hooks are never deleted", readme)
+        self.assertIn("one provider’s skip does not block the other", readme)
+        self.assertIn("interactive exact `y`/`Y` response", docs)
+        self.assertIn("Unknown or seed-only conflicts are not overwritten", docs)
+        self.assertIn("explicit nonzero stderr diagnostic", docs)
         self.assertNotIn("diagnostic to stdout", docs)
 
     def test_reviewed_through_has_one_authoritative_location(self) -> None:
@@ -321,8 +321,11 @@ class InstallerProviderPreflightRegressionTests(unittest.TestCase):
                             if state == "normal":
                                 self._assert_registered(target, provider)
                             else:
-                                self.assertEqual(self._snapshot(settings), before[provider])
                                 self.assertIn("user-owned", self._snapshot(settings)[0].decode("utf-8"))
+                                if provider == "claude":
+                                    self._assert_registered(target, provider)
+                                else:
+                                    self.assertEqual(self._snapshot(settings), before[provider])
 
     def test_wrong_handler_type_and_narrow_matcher_are_not_registered(self) -> None:
         for provider in ("codex", "claude"):
@@ -348,7 +351,17 @@ class InstallerProviderPreflightRegressionTests(unittest.TestCase):
                         result = self._run(target)
 
                         self.assertEqual(result.returncode, 0, result.stdout)
-                        self.assertEqual(self._snapshot(settings), before, "user hook settings were changed")
+                        if provider == "claude":
+                            config = json.loads(settings.read_text(encoding="utf-8"))
+                            commands = [h.get("command") for group in config["hooks"]["SessionStart"] for h in group.get("hooks", [])]
+                            if variant == "narrow-matcher":
+                                self.assertEqual(commands.count(command), 1)
+                            elif variant == "wrong-type":
+                                self.assertEqual(commands.count(command), 2)
+                            else:
+                                self._assert_registered(target, provider)
+                        else:
+                            self.assertEqual(self._snapshot(settings), before)
                         self.assertTrue((target / "AGENTS.md").is_file())
                         other_provider = "claude" if provider == "codex" else "codex"
                         self._assert_registered(target, other_provider)

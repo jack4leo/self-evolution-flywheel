@@ -71,6 +71,29 @@ def save_state(filename, state):
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, filename)
+    except Exception:
+        # The previously published journal can omit a just-created directory or
+        # pending publication. Preserve the in-memory state independently of the
+        # failed replace, and keep the original failure visible to the caller.
+        recovery = f"{filename}.pending-{os.getpid()}-{secrets.token_hex(6)}"
+        recovery_fd = None
+        try:
+            recovery_fd = os.open(recovery, os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW, 0o600)
+            payload = (json.dumps(state, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+            view = memoryview(payload)
+            while view:
+                written = os.write(recovery_fd, view)
+                if written <= 0:
+                    raise OSError("short emergency journal write")
+                view = view[written:]
+            os.fsync(recovery_fd)
+            print(f"PRESERVED pending transaction journal for manual recovery: {recovery}", file=sys.stderr)
+        except Exception as recovery_error:
+            print(f"ERROR: pending transaction journal could not be persisted: {recovery_error}; keep all reported recovery entries and the private work directory", file=sys.stderr)
+        finally:
+            if recovery_fd is not None:
+                os.close(recovery_fd)
+        raise
     finally:
         try:
             os.unlink(temporary)
@@ -1284,7 +1307,20 @@ def confirmation_snapshot(fd, parent_fd):
     }, data
 
 
-CONFIRMATION_PATHS = {"AGENTS.md", ".claude/settings.json"}
+CONFIRMATION_PATHS = {
+    "AGENTS.md", ".claude/settings.json",
+    ".agent-maintenance/flywheel-install.sh",
+    ".agent-maintenance/installer-transaction.py",
+    ".agent-maintenance/framework-ownership.py",
+    ".agent-maintenance/session-start.sh",
+    ".agent-maintenance/framework-version.json",
+    "docs/project-profile.md",
+    "scripts/freeze-review-range.py",
+    "scripts/validate_lesson_promotions.py",
+    "scripts/watermark.py",
+    "scripts/write-frozen-review.py",
+    ".github/workflows/lesson-promotion-gate.yml",
+}
 
 
 def validate_confirmation_path(relative):

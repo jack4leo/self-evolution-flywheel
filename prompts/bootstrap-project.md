@@ -17,12 +17,12 @@ Read `AGENTS.md` first, then inspect this repository as an unfamiliar project. Y
 
 ## Adapt project memory
 
-- Fill `docs/project-profile.md` with verified project facts, risk boundaries, actual gates and review schedule. Keep unknown fields `UNKNOWN` and list the evidence/decision needed.
+- Fill only the marked project-facts region of `docs/project-profile.md` with verified project facts, risk boundaries, actual gates and review schedule. Preserve both marker pairs and the framework region; if the partition is absent or ambiguous, preserve the original and ask the maintainer to resolve it manually rather than migrating old content. Keep unknown fields `UNKNOWN` and list the evidence/decision needed.
 - Keep `docs/code-standards.md`'s generic baseline intact unless the owner approves a change. Replace each `BOOTSTRAP REQUIRED` item with project-specific facts and links, or explicitly leave it `UNKNOWN`. Do not add a rule based only on preference or an unverified failure.
 - Fill the project-specific section of `docs/contributors.md` from existing policy, CI protection and owner instructions. Do not invent banned-contributor lists, trust scores, legal rules or merge/release permissions.
 - Populate `docs/subsystems/README.md` with a concise index of real responsibility areas. For each area whose contracts matter, copy `docs/subsystems/TEMPLATE.md` to a descriptive filename and document current behavior: ownership, authoritative sources, execution/data flow, state, constraints, failures, compatibility and real verification evidence.
 - Initialize `LESSONS.md` only with issues that have verifiable evidence in this repository. Assign stable, never-reused lesson IDs and record each verified review date with a specific evidence link in the structured format defined there. Do not infer review dates from commit timestamps or treat legacy `Seen N×` text, repeated mentions, or a migration date as evidence. Promote a rule only when its structured citations meet the distinct-date threshold; otherwise leave it unpromoted and state what historical evidence is missing. If no evidence can be verified, leave active lessons empty.
-- Keep `AGENTS.md` as a short routing table. If this project has other agent entry files, make them point to the same canonical rules rather than duplicating competing policy.
+- Keep `AGENTS.md` as a short routing table. Preserve the Flywheel managed-routing marker pair and framework-owned block; place project-specific routing outside it. Do not tailor framework execution scripts, the dedicated `.agent-maintenance/flywheel-install.sh`, or the version manifest to the project. The project root `install.sh`, Lessons, standards, subsystem facts and profile facts belong to the project and are not framework upgrade targets. If this project has other agent entry files, make them point to the same canonical rules rather than duplicating competing policy.
 
 ## Validation and handoff
 
